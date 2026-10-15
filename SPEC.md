@@ -49,7 +49,7 @@ pe o grilă de 1,5 px, deci precizia e ±1 px.
 - Mesaje: `HELLO 1`, `PING 2`/`PONG 3` (u32 ms, la fiecare secundă; 6 s de liniște = legătură căzută),
   `ENTER 4` [margine, păstrează-poziția, poziție u16], `LEAVE 5` [are-poziție, poziție u16],
   `MOVE 6` [dx i16, dy i16], `BUTTON 7` [buton 1–5, apăsat], `WHEEL 8` [delta i16, orizontal], `KEY 9` [vk, scan, flaguri],
-  `CLIPBOARD 10` [text UTF-8], `AUDIO 11`, `AUDIO_STATE 12`.
+  `CLIPBOARD 10` [text UTF-8], `AUDIO 11`, `AUDIO_STATE 12`, `FILE_BEGIN 13`–`FILE_END 16`.
 
 **Sunet (controlat → principal):**
 - Vista și mai nou: WASAPI loopback, adică exact ce se aude pe ieșirea implicită.
@@ -67,16 +67,23 @@ pe o grilă de 1,5 px, deci precizia e ±1 px.
 
 **Protocol:** e același pe toate versiunile de Windows și are un octet de versiune în handshake, deci principalul și controlatul trebuie doar să aibă aceeași versiune de protocol, nu aceeași versiune de Windows.
 
-**Fișiere:** copiezi fișiere în Explorer (clipboard `CF_HDROP`) → la comutare sunt trimise în
-`Desktop\KVM Primite\` pe celălalt PC, care le pune în clipboard ca `CF_HDROP`, deci **Ctrl+V** le
-lipește unde vrei. Fișierele mai mari decât o limită din config nu se trimit automat.
+**Fișiere (`src/files.c`):** copiezi fișiere sau foldere în Explorer (clipboard `CF_HDROP`). La comutare,
+un fir separat le trimite în bucăți de 32 KB, intercalate cu inputul și sunetul: `FILE_BEGIN 13` [număr u32][total u64],
+apoi pentru fiecare element `FILE 14` [e-folder u8][mărime u64][cale relativă UTF-8] și `FILE_DATA 15`,
+iar la final `FILE_END 16`. Părinții vin înaintea conținutului. Receptorul scrie direct de pe firul de rețea în
+`Desktop\Bridger Received\<dată oră>\` și pune elementele de nivel superior în clipboard ca `CF_HDROP`, deci
+**Ctrl+V** le lipește unde vrei.
+- Căile primite sunt validate: doar nume simple, nimic absolut, fără `..` și fără caractere interzise; orice
+  abatere anulează lotul, iar un folder rămas gol se șterge.
+- Peste 1 GB per copiere nu se trimite nimic (probabil o greșeală). Joncțiunile nu sunt urmate. Un fișier
+  blocat e sărit. Cât timp un transfer e în curs, o nouă copiere rămâne pe loc.
 
 ## Etape (fiecare se testează înainte de următoarea)
 1. **M0** ✅ Toolchain + schelet: `bridger.exe` cu fereastră și tray, instanță unică, installer NSIS, build XP-compatibil verificat (`tools/check_xp_imports.py`).
 2. **M1** ✅ (testat pe Win11 contra unor parteneri falși; **netestat încă pe XP real**) Rețea + criptare + mouse/tastatură: margine, dublu-tap, urgență, reconectare. Teste: `build/link_test.exe` (în build), `tests/fake_main.c`, `tests/fake_controlled.c`.
 3. **M2** ✅ Clipboard text (testat pe Win11 în ambele sensuri cu `tests/fake_main.c`).
 4. **M3** ✅ Sunet (WASAPI pe Vista+, Stereo Mix pe XP). Testat pe Win11: captura cu `fake_main audio`, redarea cu `fake_controlled 3 tone`. **Stereo Mix pe XP netestat.**
-5. **M4** Transfer fișiere prin copy/paste.
+5. **M4** ✅ Transfer fișiere prin copy/paste (testat pe Win11 în ambele sensuri, inclusiv refuzul unei căi `..\`, cu `fake_main files`).
 6. **M5** Autoupdate: GitHub Releases → principal → controlați (inclusiv XP), cu installerul rulat silențios (`/S`).
 7. **M6** Extra din Multiplicity, doar dacă le vrei: mai multe PC-uri controlate, blocare/screensaver
    sincronizat, controlat → principal în ambele sensuri.

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <wchar.h>
 #include "audio.h"
+#include "files.h"
 #include "input.h"
 #include "resource.h"
 #include "version.h"
@@ -113,6 +114,7 @@ static struct {
     int status, rtt;
     BOOL remote; /* main: input is on the controlled PC */
     int audio_state; /* AUDIO_*: how the controlled PC captures its sound */
+    wchar_t files_note[256]; /* the latest transfer, for the Files page */
 } g;
 
 static int S(int px) { return MulDiv(px, g.dpi, 96); }
@@ -163,11 +165,12 @@ static BOOL configured(void) { return g.cfg.has_key && (g.cfg.role == ROLE_CONTR
 
 static void net_status(int st) { PostMessageW(g.wnd, WM_NET_STATUS, st, 0); }
 
-static void net_send(const unsigned char *msg, int len)
+static BOOL net_send(const unsigned char *msg, int len)
 {
     EnterCriticalSection(&g.cs);
-    if (g.link_up) link_send(&g.link, msg, len);
+    BOOL ok = g.link_up && link_send(&g.link, msg, len);
     LeaveCriticalSection(&g.cs);
+    return ok;
 }
 
 /* Drops the current connection and makes the network thread re-read the config. */
@@ -252,6 +255,8 @@ static int session(SOCKET s, int role, const unsigned char key[32])
             if (buf[0] == MSG_PING && n == 5) {
                 buf[0] = MSG_PONG;
                 net_send(buf, 5);
+            } else if (buf[0] >= MSG_FILE_BEGIN && buf[0] <= MSG_FILE_END) {
+                files_receive(buf, n); /* written to disk here, so a big copy never queues up in memory */
             } else {
                 unsigned char *copy = malloc(n);
                 memcpy(copy, buf, n);
@@ -259,6 +264,7 @@ static int session(SOCKET s, int role, const unsigned char key[32])
             }
         }
         free(buf);
+        files_abort();
     }
     EnterCriticalSection(&g.cs);
     g.link_up = FALSE;
@@ -779,6 +785,14 @@ static void layout(void)
         address_line[191] = 0;
         y = add_text(mx, y, mw, address_line, g.body, C_INK2);
         break;
+    case PAGE_FILES:
+        y = add_text(mx, y, mw,
+                     L"Copy files or folders in Explorer, cross to the other PC and press Ctrl+V. They travel when "
+                     L"you cross and land in a dated folder under Bridger Received on its desktop, up to 1 GB at "
+                     L"a time.",
+                     g.body, C_INK2);
+        if (g.files_note[0]) y = add_text(mx, y + S(16), mw, g.files_note, g.body, C_INK);
+        break;
     case PAGE_SOUND: {
         static wchar_t sound[320];
         const wchar_t *name = g.peer_name[0] ? g.peer_name : L"the other PC";
@@ -999,8 +1013,11 @@ static DWORD clip_seq; /* the clipboard as Bridger last sent or set it: only a n
 static void clipboard_send(void)
 {
     if (GetClipboardSequenceNumber() == clip_seq || !OpenClipboard(g.wnd)) return;
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    const wchar_t *w = h ? GlobalLock(h) : NULL;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT), drop = GetClipboardData(CF_HDROP);
+    const wchar_t *w = h && !drop ? GlobalLock(h) : NULL;
+    /* Files copied in Explorer go instead of text; a transfer still running keeps the new copy back. */
+    if (drop && !files_send((HDROP)drop, g.peer_name))
+        lstrcpynW(g.files_note, L"Still sending the last files; copy the new ones again once they are across.", 256);
     if (w) {
         static unsigned char msg[LINK_MAX]; /* UI thread only */
         /* ponytail: text over 64 KB stays behind; chunk it if that ever matters */
@@ -1013,6 +1030,36 @@ static void clipboard_send(void)
     clip_seq = GetClipboardSequenceNumber();
 }
 
+/* Takes h whatever happens: it goes on the clipboard or is freed. */
+static void clipboard_put(UINT format, HGLOBAL h)
+{
+    BOOL open = FALSE;
+    for (int i = 0; i < 10 && !(open = OpenClipboard(g.wnd)); i++) Sleep(20); /* another app may hold it a moment */
+    if (!open) {
+        GlobalFree(h);
+        return;
+    }
+    EmptyClipboard();
+    if (!SetClipboardData(format, h)) GlobalFree(h);
+    CloseClipboard();
+    clip_seq = GetClipboardSequenceNumber();
+}
+
+/* Received files go on the clipboard as Explorer puts copied files there, so Ctrl+V pastes them. */
+static void clipboard_set_files(const wchar_t *paths)
+{
+    size_t n = 0;
+    while (paths[n]) n += wcslen(paths + n) + 1;
+    HGLOBAL h = GlobalAlloc(GHND, sizeof(DROPFILES) + (n + 1) * sizeof(wchar_t));
+    if (!h) return;
+    DROPFILES *d = GlobalLock(h);
+    d->pFiles = sizeof(DROPFILES);
+    d->fWide = TRUE;
+    memcpy(d + 1, paths, (n + 1) * sizeof(wchar_t));
+    GlobalUnlock(h);
+    clipboard_put(CF_HDROP, h);
+}
+
 static void clipboard_set(const unsigned char *s, int n)
 {
     int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)s, n, NULL, 0);
@@ -1023,16 +1070,7 @@ static void clipboard_set(const unsigned char *s, int n)
     MultiByteToWideChar(CP_UTF8, 0, (const char *)s, n, w, wn);
     w[wn] = 0;
     GlobalUnlock(h);
-    BOOL open = FALSE;
-    for (int i = 0; i < 10 && !(open = OpenClipboard(g.wnd)); i++) Sleep(20); /* another app may hold it a moment */
-    if (!open) {
-        GlobalFree(h);
-        return;
-    }
-    EmptyClipboard();
-    if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
-    CloseClipboard();
-    clip_seq = GetClipboardSequenceNumber();
+    clipboard_put(CF_UNICODETEXT, h);
 }
 
 /* The capture thread's messages go out as they are; its state also shows on this PC's Sound page. */
@@ -1162,6 +1200,15 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         if (n) net_send(msg, n);
         return 0;
     }
+    case WM_FILES_NOTE:
+        lstrcpynW(g.files_note, (const wchar_t *)lp, 256);
+        free((void *)lp);
+        refresh();
+        return 0;
+    case WM_FILES_DONE:
+        clipboard_set_files((const wchar_t *)lp);
+        free((void *)lp);
+        return 0;
     case WM_AUDIO_STATE:
         g.audio_state = (int)wp;
         refresh();
@@ -1249,6 +1296,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     CreateWindowExW(WS_EX_CONTROLPARENT, APP_CLASS, L"Bridger", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                     CW_USEDEFAULT, CW_USEDEFAULT, S(1000), S(800), NULL, NULL, inst, NULL);
     input_main_start(g.wnd);
+    files_init(g.wnd, net_send);
     sync_input();
     CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));
     /* Started at sign-in with /tray: stay in the tray until asked. */
