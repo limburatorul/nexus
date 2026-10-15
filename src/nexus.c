@@ -1,4 +1,4 @@
-/* Bridger: one keyboard, mouse and sound for PCs from Windows XP to 11.
+/* Nexus: one keyboard, mouse and sound for PCs from Windows XP to 11.
  * The settings window in Beamer's Vernier look, the tray icon, the config and the network thread.
  * Everything is plain Win32/GDI so the same exe runs on XP SP3 and on Windows 11. */
 
@@ -10,25 +10,26 @@
 #include <wchar.h>
 #include "audio.h"
 #include "files.h"
+#include "update.h"
 #include "input.h"
 #include "resource.h"
 #include "version.h"
 
 #define WIDEN2(s) L##s
 #define WIDEN(s) WIDEN2(s)
-#define APP_CLASS L"BridgerWnd"
-#define SITE_URL L"https://github.com/limburatorul/bridger"
+#define APP_CLASS L"NexusWnd"
+#define SITE_URL L"https://github.com/limburatorul/nexus"
 
 #define WM_TRAY (WM_APP + 1)
-#define WM_BRIDGER_QUIT (WM_APP + 2) /* sent by the installer before it overwrites the exe */
-#define WM_BRIDGER_SHOW (WM_APP + 3) /* sent by a second instance */
+#define WM_NEXUS_QUIT (WM_APP + 2) /* sent by the installer before it overwrites the exe */
+#define WM_NEXUS_SHOW (WM_APP + 3) /* sent by a second instance */
 #define WM_NET_STATUS (WM_APP + 4)   /* wParam: NS_* */
 #define WM_NET_MSG (WM_APP + 5)      /* wParam: length, lParam: malloc'd message, freed here */
 #define WM_AUDIO_STATE (WM_APP + 6)  /* wParam: AUDIO_* of this controlled PC */
 #define TIMER_PING 1
 
 enum { ID_TRAY_OPEN = 1, ID_TRAY_QUIT, ID_NAV0 = 100, ID_QUIT = 200, ID_SITE, ID_SETUP, ID_ROLE0, ID_ROLE1,
-       ID_EDGE0, ID_EDGE3 = ID_EDGE0 + 3, ID_PASSWORD, ID_PEER, ID_PASSWORD_LABEL, ID_PEER_LABEL };
+       ID_EDGE0, ID_EDGE3 = ID_EDGE0 + 3, ID_PASSWORD, ID_PEER, ID_PASSWORD_LABEL, ID_PEER_LABEL, ID_UPDATE };
 enum { K_NAV, K_OUTLINE, K_LINK, K_SEGMENT };
 enum { ROLE_MAIN, ROLE_CONTROLLED };
 enum { PAGE_OVERVIEW, PAGE_CROSSING, PAGE_KEYBOARD, PAGE_SOUND, PAGE_FILES, PAGE_CONNECTION };
@@ -64,17 +65,17 @@ static const struct { const wchar_t *name, *title, *desc, *eyebrow; } PAGES[] = 
 enum { NS_SETUP, NS_WAITING, NS_CONNECTING, NS_UNREACHABLE, NS_PASSWORD, NS_VERSION, NS_ROLE, NS_PEER, NS_PORT,
        NS_CONNECTED };
 static const wchar_t *STATUS_WORD[] = {L"Not set up",     L"Waiting",          L"Connecting", L"Not reachable",
-                                       L"Wrong password", L"Version mismatch", L"Same role",  L"Not Bridger",
+                                       L"Wrong password", L"Version mismatch", L"Same role",  L"Not Nexus",
                                        L"Port in use",    L"Connected"};
 static const wchar_t *STATUS_NOTE[] = {
     L"Choose this PC's role and the shared password on the Connection page.",
     L"Waiting for the main PC to connect.",
     L"Trying to reach the controlled PC.",
-    L"The controlled PC does not answer. Check that Bridger runs there and that the address is right.",
+    L"The controlled PC does not answer. Check that Nexus runs there and that the address is right.",
     L"The two PCs have different passwords. Type the same one on both.",
-    L"The other PC runs a different Bridger. Install the same version on both.",
+    L"The other PC runs a different Nexus. Install the same version on both.",
     L"Both PCs have the same role. Make one the main PC and the other the controlled PC.",
-    L"Something other than Bridger answered on port 24800.",
+    L"Something other than Nexus answered on port 24800.",
     L"Another program uses port 24800, so the main PC cannot connect to this one.",
     L""};
 static const wchar_t *EDGE_NAMES[] = {L"left", L"right", L"top", L"bottom"};
@@ -84,7 +85,7 @@ enum { L_TEXT, L_LINE, L_DOT, L_WELL, L_KEYCAP };
 
 static struct {
     HINSTANCE inst;
-    HWND wnd, hover, nav[NPAGES], quit, site, setup, role[2], edge[4], pw, peer, pw_label, peer_label;
+    HWND wnd, hover, nav[NPAGES], quit, site, update, setup, role[2], edge[4], pw, peer, pw_label, peer_label;
     WNDPROC button_proc;
     NOTIFYICONDATAW tray;
     UINT taskbar_created;
@@ -109,12 +110,16 @@ static struct {
     int gen;
     char my_name[64];
     wchar_t peer_name[64];
+    char peer_version[16]; /* "" from a Nexus too old to say */
 
     /* UI view of the link */
     int status, rtt;
     BOOL remote; /* main: input is on the controlled PC */
     int audio_state; /* AUDIO_*: how the controlled PC captures its sound */
     wchar_t files_note[256]; /* the latest transfer, for the Files page */
+    char update_version[16]; /* a newer Nexus downloaded and ready to install */
+    wchar_t update_note[256];
+    BOOL installing; /* the update goes to the controlled PC first, then this one installs */
 } g;
 
 static int S(int px) { return MulDiv(px, g.dpi, 96); }
@@ -127,18 +132,18 @@ static void config_load(void)
 {
     wchar_t v[128];
     SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, g.ini);
-    wcscat(g.ini, L"\\Bridger");
+    wcscat(g.ini, L"\\Nexus");
     CreateDirectoryW(g.ini, NULL);
-    wcscat(g.ini, L"\\bridger.ini");
+    wcscat(g.ini, L"\\nexus.ini");
 
-    GetPrivateProfileStringW(L"bridger", L"role", L"main", v, 128, g.ini);
+    GetPrivateProfileStringW(L"nexus", L"role", L"main", v, 128, g.ini);
     g.cfg.role = lstrcmpiW(v, L"controlled") == 0 ? ROLE_CONTROLLED : ROLE_MAIN;
-    GetPrivateProfileStringW(L"bridger", L"edge", L"right", v, 128, g.ini);
+    GetPrivateProfileStringW(L"nexus", L"edge", L"right", v, 128, g.ini);
     g.cfg.edge = EDGE_RIGHT;
     for (int i = 0; i < 4; i++)
         if (lstrcmpiW(v, EDGE_NAMES[i]) == 0) g.cfg.edge = i;
-    GetPrivateProfileStringW(L"bridger", L"peer", L"", g.cfg.peer, 128, g.ini);
-    GetPrivateProfileStringW(L"bridger", L"key", L"", v, 128, g.ini);
+    GetPrivateProfileStringW(L"nexus", L"peer", L"", g.cfg.peer, 128, g.ini);
+    GetPrivateProfileStringW(L"nexus", L"key", L"", v, 128, g.ini);
     g.cfg.has_key = wcslen(v) == 64;
     for (int i = 0; g.cfg.has_key && i < 64; i++) {
         wchar_t ch = v[i];
@@ -152,11 +157,11 @@ static void config_save(void)
 {
     wchar_t hex[65] = L"";
     for (int i = 0; g.cfg.has_key && i < 32; i++) _snwprintf(hex + 2 * i, 3, L"%02x", g.cfg.key[i]);
-    WritePrivateProfileStringW(L"bridger", L"role", g.cfg.role == ROLE_CONTROLLED ? L"controlled" : L"main", g.ini);
-    WritePrivateProfileStringW(L"bridger", L"edge", EDGE_NAMES[g.cfg.edge], g.ini);
-    WritePrivateProfileStringW(L"bridger", L"peer", g.cfg.peer, g.ini);
+    WritePrivateProfileStringW(L"nexus", L"role", g.cfg.role == ROLE_CONTROLLED ? L"controlled" : L"main", g.ini);
+    WritePrivateProfileStringW(L"nexus", L"edge", EDGE_NAMES[g.cfg.edge], g.ini);
+    WritePrivateProfileStringW(L"nexus", L"peer", g.cfg.peer, g.ini);
     /* The stretched key, never the password itself. */
-    WritePrivateProfileStringW(L"bridger", L"key", hex, g.ini);
+    WritePrivateProfileStringW(L"nexus", L"key", hex, g.ini);
 }
 
 static BOOL configured(void) { return g.cfg.has_key && (g.cfg.role == ROLE_CONTROLLED || g.cfg.peer[0]); }
@@ -240,13 +245,14 @@ static int session(SOCKET s, int role, const unsigned char key[32])
     LeaveCriticalSection(&g.cs);
 
     Link l;
-    char peer[64];
-    int r = link_handshake(&l, s, role == ROLE_MAIN, key, g.my_name, peer);
+    char peer[64], peer_version[16];
+    int r = link_handshake(&l, s, role == ROLE_MAIN, key, g.my_name, NEXUS_VERSION, peer, peer_version);
     if (r == LINK_OK) {
         EnterCriticalSection(&g.cs);
         g.link = l;
         g.link_up = TRUE;
         MultiByteToWideChar(CP_UTF8, 0, peer, -1, g.peer_name, 64);
+        lstrcpynA(g.peer_version, peer_version, 16);
         LeaveCriticalSection(&g.cs);
         net_status(NS_CONNECTED);
         unsigned char *buf = malloc(LINK_MAX);
@@ -255,6 +261,8 @@ static int session(SOCKET s, int role, const unsigned char key[32])
             if (buf[0] == MSG_PING && n == 5) {
                 buf[0] = MSG_PONG;
                 net_send(buf, 5);
+            } else if (buf[0] >= MSG_UPDATE_BEGIN && buf[0] <= MSG_UPDATE_END) {
+                if (role == ROLE_CONTROLLED) update_receive(buf, n);
             } else if (buf[0] >= MSG_FILE_BEGIN && buf[0] <= MSG_FILE_END) {
                 files_receive(buf, n); /* written to disk here, so a big copy never queues up in memory */
             } else {
@@ -265,6 +273,7 @@ static int session(SOCKET s, int role, const unsigned char key[32])
         }
         free(buf);
         files_abort();
+        update_abort();
     }
     EnterCriticalSection(&g.cs);
     g.link_up = FALSE;
@@ -434,7 +443,7 @@ static void status_text(void)
                    name, EDGE_NAMES[g.cfg.edge]);
     }
     g.line[255] = g.note[255] = 0;
-    _snwprintf(g.tray.szTip, 64, L"Bridger: %ls", g.line);
+    _snwprintf(g.tray.szTip, 64, L"Nexus: %ls", g.line);
     g.tray.szTip[63] = 0;
     g.tray.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g.tray);
@@ -637,7 +646,8 @@ static void draw_control(const DRAWITEMSTRUCT *d)
             else round_rect(dc, &b, S(5), hover ? p->well : bg, hover ? p->ink2 : p->edge, S(1));
             text(dc, label, r, g.button, sel ? p->ground : p->ink, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
         } else {
-            text(dc, label, r, g.small, hover ? p->ink : p->ink3, DT_SINGLELINE | DT_VCENTER);
+            COLORREF c = d->CtlID == ID_UPDATE ? p->signal : hover ? p->ink : p->ink3;
+            text(dc, label, r, d->CtlID == ID_UPDATE ? g.button : g.small, c, DT_SINGLELINE | DT_VCENTER);
         }
         if (focus) {
             RECT f = {S(1), S(1), w - S(1), h - S(1)};
@@ -699,6 +709,15 @@ static void layout(void)
         MoveWindow(g.nav[i], S(16), top + i * S(NAV_H + 4), S(SIDEBAR - 32), S(NAV_H), TRUE);
     int fy = c.bottom - S(FOOTER);
     MoveWindow(g.site, S(28), fy - S(44), S(SIDEBAR - 56), S(28), TRUE);
+    if (g.update_version[0] && g.cfg.role == ROLE_MAIN && !g.installing) {
+        wchar_t label[48];
+        _snwprintf(label, 48, L"Install Nexus %hs", g.update_version);
+        label[47] = 0;
+        SetWindowTextW(g.update, label);
+        place(g.update, S(28), fy - S(108), S(SIDEBAR - 56), S(28));
+    } else {
+        ShowWindow(g.update, SW_HIDE);
+    }
     MoveWindow(g.quit, c.right - S(32) - S(190), fy + (S(FOOTER) - S(48)) / 2, S(190), S(48), TRUE);
 
     /* Page column: Beamer's 40px margin, at most 960 wide. */
@@ -734,6 +753,7 @@ static void layout(void)
         add_label(L_LINE, mx, y, mw, S(22), detail, g.body, C_INK3, NULL);
         y += S(30);
         y = add_text(mx, y, mw, g.note, g.body, C_INK2);
+        if (g.update_note[0]) y = add_text(mx, y + S(12), mw, g.update_note, g.body, C_INK);
         break;
     case PAGE_CROSSING:
         if (!main_pc) {
@@ -788,7 +808,7 @@ static void layout(void)
     case PAGE_FILES:
         y = add_text(mx, y, mw,
                      L"Copy files or folders in Explorer, cross to the other PC and press Ctrl+V. They travel when "
-                     L"you cross and land in a dated folder under Bridger Received on its desktop, up to 1 GB at "
+                     L"you cross and land in a dated folder under Nexus Received on its desktop, up to 1 GB at "
                      L"a time.",
                      g.body, C_INK2);
         if (g.files_note[0]) y = add_text(mx, y + S(16), mw, g.files_note, g.body, C_INK);
@@ -808,7 +828,7 @@ static void layout(void)
         else if (g.audio_state == AUDIO_NONE)
             _snwprintf(sound, 320,
                        L"%ls cannot record what its speakers play. On Windows XP, turn on the Stereo Mix (or What U "
-                       L"Hear) recording device in the Sounds and Audio Devices control panel; Bridger looks again "
+                       L"Hear) recording device in the Sounds and Audio Devices control panel; Nexus looks again "
                        L"every few seconds.",
                        main_pc ? name : L"This PC");
         else
@@ -853,7 +873,7 @@ static void paint(HDC win)
     text(dc, rtt, r, g.body, p->ink2, DT_SINGLELINE | DT_VCENTER);
 
     SetRect(&r, S(28), fy - S(72), S(SIDEBAR - 16), fy - S(46));
-    text(dc, L"Bridger " WIDEN(BRIDGER_VERSION), r, g.small, p->ink3, DT_SINGLELINE | DT_VCENTER);
+    text(dc, L"Nexus " WIDEN(NEXUS_VERSION), r, g.small, p->ink3, DT_SINGLELINE | DT_VCENTER);
 
     /* Page */
     SetRect(&r, g.desc_rc.left, S(40), g.desc_rc.right, S(40) + S(40));
@@ -885,7 +905,7 @@ static void paint(HDC win)
     SetRect(&r, 0, fy, c.right, c.bottom), fill(dc, &r, p->ground);
     SetRect(&r, 0, fy, c.right, fy + 1), fill(dc, &r, p->rule);
     SetRect(&r, S(28), fy + S(18), c.right - S(260), c.bottom - S(18));
-    text(dc, L"Changes apply as you make them. Closing this window keeps Bridger running in the tray.", r,
+    text(dc, L"Changes apply as you make them. Closing this window keeps Nexus running in the tray.", r,
          g.body, p->ink2, DT_WORDBREAK);
 
     BitBlt(win, 0, 0, c.right, c.bottom, dc, 0, 0, SRCCOPY);
@@ -980,7 +1000,7 @@ static void tray_add(void)
     g.tray.uCallbackMessage = WM_TRAY;
     g.tray.hIcon = (HICON)LoadImageW(g.inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                      GetSystemMetrics(SM_CYSMICON), 0);
-    lstrcpynW(g.tray.szTip, L"Bridger", 64);
+    lstrcpynW(g.tray.szTip, L"Nexus", 64);
     Shell_NotifyIconW(NIM_ADD, &g.tray);
 }
 
@@ -988,7 +1008,7 @@ static void tray_menu(void)
 {
     POINT pt;
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, ID_TRAY_OPEN, L"Open Bridger");
+    AppendMenuW(m, MF_STRING, ID_TRAY_OPEN, L"Open Nexus");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, ID_TRAY_QUIT, L"Quit");
     SetMenuDefaultItem(m, ID_TRAY_OPEN, FALSE);
@@ -1008,7 +1028,7 @@ static void quit(void)
 
 /* ---- clipboard: the PC giving up input sends its text, so a copy there pastes here ---- */
 
-static DWORD clip_seq; /* the clipboard as Bridger last sent or set it: only a newer copy travels */
+static DWORD clip_seq; /* the clipboard as Nexus last sent or set it: only a newer copy travels */
 
 static void clipboard_send(void)
 {
@@ -1063,7 +1083,7 @@ static void clipboard_set_files(const wchar_t *paths)
 static void clipboard_set(const unsigned char *s, int n)
 {
     int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)s, n, NULL, 0);
-    if (wn <= 0) return; /* not valid UTF-8: not from Bridger */
+    if (wn <= 0) return; /* not valid UTF-8: not from Nexus */
     HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (wn + 1) * sizeof(wchar_t));
     if (!h) return;
     wchar_t *w = GlobalLock(h);
@@ -1078,6 +1098,39 @@ static void audio_out(const unsigned char *msg, int len)
 {
     if (msg[0] == MSG_AUDIO_STATE) PostMessageW(g.wnd, WM_AUDIO_STATE, msg[1], 0);
     net_send(msg, len);
+}
+
+static BOOL is_main_pc(void) { return g.cfg.role == ROLE_MAIN; }
+
+/* Main PC, on connecting: a controlled PC with an older Nexus gets this PC's own installer. */
+static void update_peer(void)
+{
+    wchar_t path[MAX_PATH];
+    const wchar_t *name = g.peer_name[0] ? g.peer_name : L"The controlled PC";
+    g.update_note[0] = 0;
+    if (!g.peer_version[0])
+        _snwprintf(g.update_note, 256, L"%ls runs a Nexus too old to be updated from here. Install "
+                                       L"Nexus " WIDEN(NEXUS_VERSION) L" there by hand once.", name);
+    else if (version_cmp(g.peer_version, NEXUS_VERSION) < 0 && update_installer(NEXUS_VERSION, path) &&
+             update_push(NEXUS_VERSION, net_send))
+        _snwprintf(g.update_note, 256, L"Updating %ls to Nexus " WIDEN(NEXUS_VERSION) L"\x2026", name);
+    g.update_note[255] = 0;
+}
+
+/* The sidebar button: the controlled PC first if it is behind, then this PC (its installer restarts Nexus). */
+static void install_update(void)
+{
+    wchar_t path[MAX_PATH];
+    if (!update_installer(g.update_version, path)) return;
+    g.installing = TRUE;
+    if (g.status == NS_CONNECTED && g.peer_version[0] && version_cmp(g.peer_version, g.update_version) < 0 &&
+        update_push(g.update_version, net_send)) {
+        _snwprintf(g.update_note, 256, L"Sending Nexus %hs to %ls first\x2026", g.update_version, g.peer_name);
+        g.update_note[255] = 0;
+    } else {
+        update_run(path);
+    }
+    refresh();
 }
 
 static void on_net_msg(unsigned char *msg, int len)
@@ -1120,8 +1173,9 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         g.pw = add_field(L"Shared password", ID_PASSWORD_LABEL, ID_PASSWORD, ES_PASSWORD, &g.pw_label);
         g.peer = add_field(L"Controlled PC's address", ID_PEER_LABEL, ID_PEER, 0, &g.peer_label);
         SetWindowTextW(g.peer, g.cfg.peer);
-        g.site = add_button(L"Bridger on GitHub", ID_SITE, K_LINK);
-        g.quit = add_button(L"Quit Bridger", ID_QUIT, K_OUTLINE);
+        g.site = add_button(L"Nexus on GitHub", ID_SITE, K_LINK);
+        g.update = add_button(L"", ID_UPDATE, K_LINK);
+        g.quit = add_button(L"Quit Nexus", ID_QUIT, K_OUTLINE);
         apply_theme();
         tray_add();
         SetTimer(w, TIMER_PING, 1000, NULL);
@@ -1165,6 +1219,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         } else if (id == ID_QUIT || id == ID_TRAY_QUIT) quit();
         else if (id == ID_TRAY_OPEN) show_window();
         else if (id == ID_SITE) ShellExecuteW(NULL, L"open", SITE_URL, NULL, NULL, SW_SHOWNORMAL);
+        else if (id == ID_UPDATE) install_update();
         return 0;
     }
     case WM_TIMER:
@@ -1183,6 +1238,8 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
                 audio_play_stop();
             } else if (g.cfg.role == ROLE_CONTROLLED) {
                 audio_capture_start(audio_out);
+            } else {
+                update_peer();
             }
             g.status = (int)wp;
             sync_input();
@@ -1200,6 +1257,30 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         if (n) net_send(msg, n);
         return 0;
     }
+    case WM_UPDATE_READY:
+        lstrcpynA(g.update_version, (const char *)lp, 16);
+        free((void *)lp);
+        refresh();
+        return 0;
+    case WM_UPDATE_PUSHED: {
+        const wchar_t *name = g.peer_name[0] ? g.peer_name : L"The controlled PC";
+        if (wp) _snwprintf(g.update_note, 256, L"%ls got the update and installs it now. On Windows Vista or later, "
+                                               L"confirm the Windows prompt on its own screen.", name);
+        else _snwprintf(g.update_note, 256, L"Sending the update to %ls did not finish; it is tried again on the "
+                                            L"next connection.", name);
+        g.update_note[255] = 0;
+        if (g.installing) {
+            wchar_t path[MAX_PATH];
+            if (update_installer(g.update_version, path)) update_run(path);
+            else g.installing = FALSE;
+        }
+        refresh();
+        return 0;
+    }
+    case WM_UPDATE_RUN:
+        update_run((const wchar_t *)lp);
+        free((void *)lp);
+        return 0;
     case WM_FILES_NOTE:
         lstrcpynW(g.files_note, (const wchar_t *)lp, 256);
         free((void *)lp);
@@ -1224,13 +1305,13 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     case WM_SETTINGCHANGE:
         if (lp && lstrcmpW((const wchar_t *)lp, L"ImmersiveColorSet") == 0) apply_theme(), refresh();
         return 0;
-    case WM_CLOSE: /* closing keeps Bridger in the tray, as Beamer does */
+    case WM_CLOSE: /* closing keeps Nexus in the tray, as Beamer does */
         ShowWindow(w, SW_HIDE);
         return 0;
-    case WM_BRIDGER_SHOW:
+    case WM_NEXUS_SHOW:
         show_window();
         return 0;
-    case WM_BRIDGER_QUIT:
+    case WM_NEXUS_QUIT:
         quit();
         return 0;
     case WM_DESTROY:
@@ -1248,12 +1329,12 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
     (void)prev;
-    CreateMutexW(NULL, FALSE, L"Local\\Bridger");
+    CreateMutexW(NULL, FALSE, L"Local\\Nexus");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND other = FindWindowW(APP_CLASS, NULL);
         if (other) {
             AllowSetForegroundWindow(ASFW_ANY);
-            PostMessageW(other, WM_BRIDGER_SHOW, 0, 0);
+            PostMessageW(other, WM_NEXUS_SHOW, 0, 0);
         }
         return 0;
     }
@@ -1293,10 +1374,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     RegisterClassExW(&wc);
 
     /* WS_EX_CONTROLPARENT + IsDialogMessage give Tab/Shift+Tab between the controls. */
-    CreateWindowExW(WS_EX_CONTROLPARENT, APP_CLASS, L"Bridger", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+    CreateWindowExW(WS_EX_CONTROLPARENT, APP_CLASS, L"Nexus", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                     CW_USEDEFAULT, CW_USEDEFAULT, S(1000), S(800), NULL, NULL, inst, NULL);
     input_main_start(g.wnd);
     files_init(g.wnd, net_send);
+    update_start(g.wnd, is_main_pc);
     sync_input();
     CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));
     /* Started at sign-in with /tray: stay in the tray until asked. */

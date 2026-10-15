@@ -4,12 +4,13 @@
 #include <string.h>
 #include "../src/link.h"
 
-typedef struct { SOCKET s; int is_main, result; unsigned char key[32]; char peer[64]; Link l; } Side;
+typedef struct { SOCKET s; int is_main, result; unsigned char key[32]; char peer[64], peer_version[16]; Link l; } Side;
 
 static DWORD WINAPI run(void *p)
 {
     Side *d = p;
-    d->result = link_handshake(&d->l, d->s, d->is_main, d->key, d->is_main ? "main-pc" : "xp-box", d->peer);
+    d->result = link_handshake(&d->l, d->s, d->is_main, d->key, d->is_main ? "main-pc" : "xp-box",
+                               d->is_main ? "0.3.1" : "0.2.0", d->peer, d->peer_version);
     return 0;
 }
 
@@ -52,6 +53,7 @@ int main(void)
     handshake(&m, &c, "correct horse", "correct horse", 0);
     assert(m.result == LINK_OK && c.result == LINK_OK);
     assert(strcmp(m.peer, "xp-box") == 0 && strcmp(c.peer, "main-pc") == 0);
+    assert(strcmp(m.peer_version, "0.2.0") == 0 && strcmp(c.peer_version, "0.3.1") == 0);
     for (int i = 0; i < LINK_MAX; i++) big[i] = (unsigned char)(i * 7);
     assert(link_send(&m.l, "\x06\x01\x00\xff\xff", 5));
     assert(link_recv(&c.l, got, sizeof got) == 5 && memcmp(got, "\x06\x01\x00\xff\xff", 5) == 0);

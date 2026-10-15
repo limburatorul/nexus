@@ -1,4 +1,4 @@
-"""Fails the build when bridger.exe imports a function Windows XP SP3 does not export.
+"""Fails the build when nexus.exe imports a function Windows XP SP3 does not export.
 
 xp_imports.txt lists every DLL!function checked present on XP SP3. A new import has to be checked
 against XP (MSDN's "Minimum supported client", or the DLL on a real XP) and added there by hand;

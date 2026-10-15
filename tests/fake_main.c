@@ -1,9 +1,9 @@
-/* Plays the main PC against a running Bridger set up as the controlled PC with password "test-pw"
+/* Plays the main PC against a running Nexus set up as the controlled PC with password "test-pw"
  * on this machine: sends clipboard text, crosses in at the left edge, moves right, copies text
  * "there", pushes back out and expects that text, then LEAVE.
  * Moves this PC's pointer briefly and borrows its clipboard text (both put back); sends no keys.
  * "fake_main audio" instead checks that sound playing here comes back over the link.
- * "fake_main files" sends files both ways; it writes under Desktop\Bridger Received and cleans up. */
+ * "fake_main files" sends files both ways; it writes under Desktop\Nexus Received and cleans up. */
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,7 +58,7 @@ static void move(int dx, int dy)
     Sleep(100);
 }
 
-/* "fake_main audio": plays a quiet 440 Hz tone here and expects Bridger to send it back as MSG_AUDIO. */
+/* "fake_main audio": plays a quiet 440 Hz tone here and expects Nexus to send it back as MSG_AUDIO. */
 static int audio_check(void)
 {
     static short tone[44100 * 2 * 3 / 2]; /* 1.5 s stereo */
@@ -157,7 +157,7 @@ static int files_check(void)
     Sleep(500);
     assert(clip_files(got) == 2);
     printf("received: %ls\n          %ls\n", got[0], got[1]);
-    assert(wcsstr(got[0], L"\\Bridger Received\\") && wcsstr(got[0], L"\\bt") && wcsstr(got[1], L"\\b.bin"));
+    assert(wcsstr(got[0], L"\\Nexus Received\\") && wcsstr(got[0], L"\\bt") && wcsstr(got[1], L"\\b.bin"));
     lstrcpynW(parent, got[0], MAX_PATH);
     *wcsrchr(parent, L'\\') = 0;
     _snwprintf(probe, MAX_PATH, L"%ls\\a.txt", got[0]);
@@ -181,7 +181,7 @@ static int files_check(void)
     assert(link_send(&l, &end, 1));
     Sleep(300);
     SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, desk);
-    _snwprintf(probe, MAX_PATH, L"%ls\\Bridger Received\\escape.txt", desk);
+    _snwprintf(probe, MAX_PATH, L"%ls\\Nexus Received\\escape.txt", desk);
     assert(GetFileAttributesW(probe) == INVALID_FILE_ATTRIBUTES);
     assert(clip_files(got) == 2); /* the refused batch did not replace the clipboard */
     puts("unsafe path refused");
@@ -189,7 +189,7 @@ static int files_check(void)
     /* controlled -> main: a file copied "there" travels when input leaves it */
     wchar_t src[MAX_PATH];
     GetTempPathW(MAX_PATH, src);
-    wcscat(src, L"bridger-send.txt");
+    wcscat(src, L"nexus-send.txt");
     f = CreateFileW(src, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     WriteFile(f, "from controlled", 15, &n, NULL);
     CloseHandle(f);
@@ -209,16 +209,71 @@ static int files_check(void)
     for (int k = 0; k < 4; k++) {
         int len = next(buf);
         assert(len > 0 && buf[0] == kinds[k]);
-        if (buf[0] == MSG_FILE) assert(len == 10 + 16 && !memcmp(buf + 10, "bridger-send.txt", 16) && buf[2] == 15);
+        if (buf[0] == MSG_FILE) assert(len == 10 + 14 && !memcmp(buf + 10, "nexus-send.txt", 14) && buf[2] == 15);
         if (buf[0] == MSG_FILE_DATA) assert(len == 16 && !memcmp(buf + 1, "from controlled", 15));
     }
     puts("file sent back on leaving");
 
     remove_tree(parent);
     DeleteFileW(src);
-    _snwprintf(probe, MAX_PATH, L"%ls\\Bridger Received", desk);
+    _snwprintf(probe, MAX_PATH, L"%ls\\Nexus Received", desk);
     RemoveDirectoryW(probe); /* only if this test left it empty */
     puts("fake_main files: ok");
+    return 0;
+}
+
+static void send_update(const char *version, const unsigned char *bytes, DWORD size)
+{
+    static unsigned char m[1 + 32768];
+    int v = (int)strlen(version);
+    m[0] = MSG_UPDATE_BEGIN;
+    for (int i = 0; i < 4; i++) m[1 + i] = (unsigned char)(size >> (8 * i));
+    memcpy(m + 5, version, v);
+    assert(link_send(&l, m, 5 + v));
+    for (DWORD at = 0; at < size; at += 32768) {
+        DWORD n = size - at < 32768 ? size - at : 32768;
+        m[0] = MSG_UPDATE_DATA;
+        memcpy(m + 1, bytes + at, n);
+        assert(link_send(&l, m, 1 + (int)n));
+    }
+    m[0] = MSG_UPDATE_END;
+    assert(link_send(&l, m, 1));
+    Sleep(1500);
+}
+
+/* "fake_main update <stand-in.exe>": older versions and non-programs are refused; a newer program runs
+ * with /S. The stand-in records its command line in %TEMP%\nexus-update-ran.txt. */
+static int update_check(const char *stand_in)
+{
+    static unsigned char exe[4 << 20];
+    char marker[MAX_PATH], line[512] = {0};
+    GetTempPathA(MAX_PATH, marker);
+    strcat(marker, "nexus-update-ran.txt");
+    DeleteFileA(marker);
+    FILE *f = fopen(stand_in, "rb");
+    assert(f);
+    DWORD size = (DWORD)fread(exe, 1, sizeof exe, f);
+    fclose(f);
+
+    send_update("0.0.1", exe, size); /* older than the running Nexus */
+    assert(GetFileAttributesA(marker) == INVALID_FILE_ATTRIBUTES);
+    send_update("9.9.9", (const unsigned char *)"not a program", 13);
+    assert(GetFileAttributesA(marker) == INVALID_FILE_ATTRIBUTES);
+    puts("older version and non-program refused");
+
+    send_update("9.9.9", exe, size);
+    f = fopen(marker, "r");
+    assert(f);
+    fgets(line, sizeof line, f);
+    fclose(f);
+    printf("installer ran as: %s\n", line);
+    assert(strstr(line, "Nexus-Setup-9.9.9.exe") && strstr(line, "/S"));
+    DeleteFileA(marker);
+    char setup[MAX_PATH];
+    GetTempPathA(MAX_PATH, setup);
+    strcat(setup, "Nexus-Setup-9.9.9.exe");
+    DeleteFileA(setup);
+    puts("fake_main update: ok");
     return 0;
 }
 
@@ -239,12 +294,13 @@ int main(int argc, char **argv)
     SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     assert(connect(s, (struct sockaddr *)&a, sizeof a) == 0);
     unsigned char key[32], buf[LINK_MAX];
-    char peer[64];
+    char peer[64], peer_version[16];
     link_key_from_password("test-pw", key);
-    int r = link_handshake(&l, s, 1, key, "fake-main", peer);
+    int r = link_handshake(&l, s, 1, key, "fake-main", "0.0.1", peer, peer_version);
     printf("handshake %d, peer %s\n", r, peer);
     assert(r == LINK_OK);
     if (argc > 1 && strcmp(argv[1], "audio") == 0) return audio_check();
+    if (argc > 2 && strcmp(argv[1], "update") == 0) return update_check(argv[2]);
     if (argc > 1 && strcmp(argv[1], "files") == 0) {
         wchar_t saved_text[256];
         lstrcpynW(saved_text, clip_get(), 256);

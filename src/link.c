@@ -1,4 +1,4 @@
-/* Handshake: each side sends "BRDG", the link version, its role and a fresh 24-byte nonce in clear.
+/* Handshake: each side sends "NXUS", the link version, its role and a fresh 24-byte nonce in clear.
  * SHA-512(key || main nonce || controlled nonce) gives one 32-byte key per direction. Every frame is
  * then u32 length (LE) + XSalsa20-Poly1305 ciphertext, its nonce the direction's frame counter.
  * The first frame each way is HELLO with the PC's name: if it does not open, the passwords differ. */
@@ -9,22 +9,23 @@
 #include "tweetnacl.h"
 
 
-static const unsigned char MAGIC[4] = {'B', 'R', 'D', 'G'};
+static const unsigned char MAGIC[4] = {'N', 'X', 'U', 'S'};
 
 /* TweetNaCl's source of randomness. Without it no nonce is safe, so there is no carrying on. */
 void randombytes(unsigned char *p, unsigned long long n)
 {
-    if (!RtlGenRandom(p, (ULONG)n)) FatalAppExitW(0, L"Bridger: no system random number generator.");
+    if (!RtlGenRandom(p, (ULONG)n)) FatalAppExitW(0, L"Nexus: no system random number generator.");
 }
 
 void link_key_from_password(const char *pw, unsigned char key[32])
 {
-    unsigned char buf[8 + 256], h[64];
+    static const char salt[] = "nexus1";
+    unsigned char buf[sizeof salt - 1 + 256], h[64];
     size_t n = strlen(pw);
     if (n > 256) n = 256;
-    memcpy(buf, "bridger1", 8);
-    memcpy(buf + 8, pw, n);
-    crypto_hash(h, buf, 8 + n);
+    memcpy(buf, salt, sizeof salt - 1);
+    memcpy(buf + sizeof salt - 1, pw, n);
+    crypto_hash(h, buf, sizeof salt - 1 + n);
     /* ponytail: plain iterated SHA-512; a real KDF (scrypt) if offline guessing of weak passwords matters */
     for (int i = 0; i < 20000; i++) crypto_hash(h, h, 64);
     memcpy(key, h, 32);
@@ -88,9 +89,10 @@ int link_recv(Link *l, unsigned char *out, int cap)
     return len;
 }
 
-int link_handshake(Link *l, SOCKET s, int is_main, const unsigned char key[32], const char *name, char peer[64])
+int link_handshake(Link *l, SOCKET s, int is_main, const unsigned char key[32], const char *name, const char *version,
+                   char peer[64], char peer_version[16])
 {
-    unsigned char mine[30], theirs[30], buf[80], h[64], msg[64];
+    unsigned char mine[30], theirs[30], buf[80], h[64], msg[96];
     memcpy(mine, MAGIC, 4);
     mine[4] = LINK_VERSION;
     mine[5] = is_main ? 0 : 1;
@@ -109,16 +111,21 @@ int link_handshake(Link *l, SOCKET s, int is_main, const unsigned char key[32], 
     l->s = s;
     l->ntx = l->nrx = 0;
 
-    int n = (int)strlen(name);
+    int n = (int)strlen(name), v = (int)strlen(version);
     if (n > 63) n = 63;
+    if (v > 15) v = 15;
     msg[0] = MSG_HELLO;
     memcpy(msg + 1, name, n);
-    if (!link_send(l, msg, n + 1)) return LINK_ERR_NET;
-    int r = link_recv(l, msg, sizeof msg);
+    msg[1 + n] = 0;
+    memcpy(msg + 2 + n, version, v);
+    if (!link_send(l, msg, n + v + 2)) return LINK_ERR_NET;
+    int r = link_recv(l, msg, sizeof msg - 1);
     if (r == LINK_RECV_FORGED) return LINK_ERR_PASSWORD;
     if (r < 1) return LINK_ERR_NET;
     if (msg[0] != MSG_HELLO) return LINK_ERR_PEER;
-    memcpy(peer, msg + 1, r - 1);
-    peer[r - 1] = 0;
+    msg[r] = 0;
+    const char *their_name = (const char *)msg + 1, *nul = memchr(their_name, 0, r - 1);
+    lstrcpynA(peer, their_name, 64);
+    lstrcpynA(peer_version, nul ? nul + 1 : "", 16); /* Nexus 0.1.0 sent the name alone */
     return LINK_OK;
 }

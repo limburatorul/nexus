@@ -2,7 +2,7 @@
 #include "resource.h"
 #include "version.h"
 
-IDI_APP ICON "../res/bridger.ico"
+IDI_APP ICON "../res/nexus.ico"
 
 IDR_FONT_REGULAR RCDATA "../res/fonts/HankenGrotesk-Regular.ttf"
 IDR_FONT_SEMIBOLD RCDATA "../res/fonts/HankenGrotesk-SemiBold.ttf"
@@ -19,11 +19,11 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "CompanyName", "Bridger"
-      VALUE "FileDescription", "Bridger - keyboard, mouse and sound across PCs"
-      VALUE "FileVersion", BRIDGER_VERSION
-      VALUE "ProductName", "Bridger"
-      VALUE "ProductVersion", BRIDGER_VERSION
+      VALUE "CompanyName", "Nexus"
+      VALUE "FileDescription", "Nexus - keyboard, mouse and sound across PCs"
+      VALUE "FileVersion", NEXUS_VERSION
+      VALUE "ProductName", "Nexus"
+      VALUE "ProductVersion", NEXUS_VERSION
       VALUE "LegalCopyright", "GPL-3.0-or-later"
     END
   END

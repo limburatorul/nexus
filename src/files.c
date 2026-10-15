@@ -1,6 +1,6 @@
 /* Wire: FILE_BEGIN [count u32][total u64], then per item FILE [is_dir u8][size u64][relative path, UTF-8]
  * followed by FILE_DATA chunks for a file's bytes, then FILE_END. Items arrive parents first.
- * The receiver writes into Desktop\Bridger Received\<date time>\ and puts the top-level items on
+ * The receiver writes into Desktop\Nexus Received\<date time>\ and puts the top-level items on
  * the clipboard, so Ctrl+V in Explorer copies them where wanted. */
 
 #include "link.h" /* winsock2.h before windows.h */
@@ -119,7 +119,7 @@ static DWORD WINAPI send_thread(void *p)
     wchar_t size[32];
     size_text(size, b->total);
     if (b->total > FILES_MAX_BYTES) {
-        note(L"The copied files are %ls, over the 1 GB Bridger carries at once, so they stayed on this PC.", size);
+        note(L"The copied files are %ls, over the 1 GB Nexus carries at once, so they stayed on this PC.", size);
     } else {
         unsigned char begin[13] = {MSG_FILE_BEGIN};
         for (int i = 0; i < 4; i++) begin[1 + i] = (unsigned char)(b->count >> (8 * i));
@@ -224,9 +224,9 @@ static void begin(const unsigned char *m, int len)
     GetLocalTime(&t);
     wchar_t desk[MAX_PATH];
     if (SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, desk) != S_OK) return;
-    _snwprintf(rx.dir, MAX_PATH, L"%ls\\Bridger Received", desk);
+    _snwprintf(rx.dir, MAX_PATH, L"%ls\\Nexus Received", desk);
     CreateDirectoryW(rx.dir, NULL);
-    _snwprintf(rx.dir, MAX_PATH, L"%ls\\Bridger Received\\%04d-%02d-%02d %02d-%02d-%02d", desk, t.wYear, t.wMonth,
+    _snwprintf(rx.dir, MAX_PATH, L"%ls\\Nexus Received\\%04d-%02d-%02d %02d-%02d-%02d", desk, t.wYear, t.wMonth,
                t.wDay, t.wHour, t.wMinute, t.wSecond);
     rx.dir[MAX_PATH - 1] = 0;
     for (int i = 2; !CreateDirectoryW(rx.dir, NULL); i++) { /* two batches within one second */

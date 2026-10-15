@@ -177,7 +177,7 @@ static DWORD WINAPI hook_thread(void *ready)
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = DefWindowProcW;
     wc.hInstance = inst;
-    wc.lpszClassName = L"BridgerHider"; /* no class cursor: the pointer vanishes over it */
+    wc.lpszClassName = L"NexusHider"; /* no class cursor: the pointer vanishes over it */
     RegisterClassW(&wc);
     m.hider = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE, wc.lpszClassName,
                               L"", WS_POPUP, 0, 0, 64, 64, NULL, NULL, inst, NULL);

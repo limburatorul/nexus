@@ -1,7 +1,7 @@
-/* Plays the controlled PC for a running Bridger set up as the main PC with password "test-pw" and
+/* Plays the controlled PC for a running Nexus set up as the main PC with password "test-pw" and
  * address 127.0.0.1: accepts it, answers pings for a few seconds and prints what arrives.
  * "fake_controlled 5 tone" first streams 2 s of a quiet 440 Hz tone and checks, with the default
- * speakers' peak meter, that Bridger plays it (other sound playing at the time also counts). */
+ * speakers' peak meter, that Nexus plays it (other sound playing at the time also counts). */
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -73,9 +73,9 @@ int main(int argc, char **argv)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&t, sizeof t);
     Link l;
     unsigned char key[32], buf[LINK_MAX];
-    char peer[64];
+    char peer[64], peer_version[16];
     link_key_from_password("test-pw", key);
-    int r = link_handshake(&l, s, 0, key, "fake-xp", peer);
+    int r = link_handshake(&l, s, 0, key, "fake-xp", "0.0.1", peer, peer_version);
     printf("handshake %d, peer %s\n", r, peer);
     assert(r == LINK_OK);
     if (argc > 2 && strcmp(argv[2], "tone") == 0) stream_tone(&l);

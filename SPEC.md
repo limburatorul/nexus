@@ -1,6 +1,6 @@
-# Bridger: KVM software (tastatură + mouse + sunet + clipboard + fișiere), XP → Win11
+# Nexus: KVM software (tastatură + mouse + sunet + clipboard + fișiere), XP → Win11
 
-Inspirat din Beamer (github.com/kalkman-code/beamer, GPL-3: preluăm ideile și design-ul, de aceea și Bridger e GPL-3) și din Stardock Multiplicity.
+Inspirat din Beamer (github.com/kalkman-code/beamer, GPL-3: preluăm ideile și design-ul, de aceea și Nexus e GPL-3) și din Stardock Multiplicity.
 
 ## Obiectiv
 Un PC **principal** (are tastatura și mouse-ul fizice, Win7–11) controlează unul sau mai multe PC-uri
@@ -10,14 +10,14 @@ boxele principalului.
 ## Decizii
 | Ce | Alegere | De ce |
 |---|---|---|
-| Limbaj | C / Win32, un singur `bridger.exe` pentru ambele roluri | Singura variantă care merge pe XP fără runtime instalat |
+| Limbaj | C / Win32, un singur `nexus.exe` pentru ambele roluri | Singura variantă care merge pe XP fără runtime instalat |
 | Compilator | MinGW-w64 **i686**, runtime **msvcrt** (nu UCRT), `_WIN32_WINNT=0x0501` | Binar 32-bit rulează pe XP 32-bit și pe Win11 64-bit |
 | Criptare | TweetNaCl (1 fișier C, domeniu public): `crypto_secretbox` (XSalsa20-Poly1305) | Fără OpenSSL; merge pe XP |
-| Cheie | parolă comună în `bridger.ini`; cheia de sesiune = SHA-512(parolă ‖ nonce_A ‖ nonce_B) | Nonce-uri noi la fiecare conexiune; o parolă slabă rămâne totuși ghicibilă offline, deci recomandăm una lungă |
-| Config | `%APPDATA%\Bridgerridger.ini` (`GetPrivateProfileString`) | Nativ, ușor de editat de mână; Program Files nu e scriibil |
+| Cheie | parolă comună în `nexus.ini`; cheia de sesiune = SHA-512(parolă ‖ nonce_A ‖ nonce_B) | Nonce-uri noi la fiecare conexiune; o parolă slabă rămâne totuși ghicibilă offline, deci recomandăm una lungă |
+| Config | `%APPDATA%\Nexus\nexus.ini` (`GetPrivateProfileString`) | Nativ, ușor de editat de mână; Program Files nu e scriibil |
 | Interfață | Fereastră Win32 desenată de mână, cu aspectul Beamer (paleta Vernier, Hanken Grotesk), și iconiță în tray | Qt-ul din Beamer nu rulează pe XP; un singur cod pentru XP, 7 și 10/11 |
-| Installer | NSIS 3, un singur `Bridger-Setup-x.y.z.exe` | NSIS suportă XP, Inno Setup 6 nu |
-| Repo | github.com/limburatorul/bridger, public, GPL-3.0 | Preluăm design-ul Beamer (GPL-3) |
+| Installer | NSIS 3, un singur `Nexus-Setup-x.y.z.exe` | NSIS suportă XP, Inno Setup 6 nu |
+| Repo | github.com/limburatorul/nexus, public, GPL-3.0 | Preluăm design-ul Beamer (GPL-3) |
 | Autoupdate | Principalul verifică GitHub Releases și instalează silențios; **controlatul primește update-ul de la principal**, prin legătura criptată | XP nu are TLS 1.2, deci nu poate vorbi direct cu GitHub |
 
 ## Cum funcționează
@@ -38,11 +38,11 @@ eliberează toate tastele și butoanele ținute. Pe un ecran scalat la 150%, Win
 pe o grilă de 1,5 px, deci precizia e ±1 px.
 
 **Transport (implementat în `src/link.c`):** TCP pe portul 24800. Controlatul ascultă, principalul se conectează.
-- Handshake în clar, 30 de octeți în fiecare sens: `"BRDG"`, versiunea legăturii (1), rolul (0 principal,
+- Handshake în clar, 30 de octeți în fiecare sens: `"NXUS"`, versiunea legăturii (1), rolul (0 principal,
   1 controlat) și un nonce aleator de 24 de octeți.
 - Cheia: `SHA-512(cheie_parolă ‖ nonce_principal ‖ nonce_controlat)`; primii 32 de octeți sunt pentru
   principal → controlat, următorii 32 pentru invers. `cheie_parolă` = SHA-512 iterat de 20.000 de ori peste
-  `"bridger1" ‖ parolă`; în `bridger.ini` se salvează doar această cheie, niciodată parola.
+  `"nexus1" ‖ parolă`; în `nexus.ini` se salvează doar această cheie, niciodată parola.
 - Cadre: `[lungime u32 LE][XSalsa20-Poly1305]`; nonce-ul e contorul de cadre al direcției și nu se trimite,
   deci un cadru reluat sau reordonat nu se deschide.
 - Primul cadru în fiecare sens e `HELLO` cu numele PC-ului. Dacă nu se deschide, parolele diferă.
@@ -71,7 +71,7 @@ pe o grilă de 1,5 px, deci precizia e ±1 px.
 un fir separat le trimite în bucăți de 32 KB, intercalate cu inputul și sunetul: `FILE_BEGIN 13` [număr u32][total u64],
 apoi pentru fiecare element `FILE 14` [e-folder u8][mărime u64][cale relativă UTF-8] și `FILE_DATA 15`,
 iar la final `FILE_END 16`. Părinții vin înaintea conținutului. Receptorul scrie direct de pe firul de rețea în
-`Desktop\Bridger Received\<dată oră>\` și pune elementele de nivel superior în clipboard ca `CF_HDROP`, deci
+`Desktop\Nexus Received\<dată oră>\` și pune elementele de nivel superior în clipboard ca `CF_HDROP`, deci
 **Ctrl+V** le lipește unde vrei.
 - Căile primite sunt validate: doar nume simple, nimic absolut, fără `..` și fără caractere interzise; orice
   abatere anulează lotul, iar un folder rămas gol se șterge.
@@ -79,12 +79,20 @@ iar la final `FILE_END 16`. Părinții vin înaintea conținutului. Receptorul s
   blocat e sărit. Cât timp un transfer e în curs, o nouă copiere rămâne pe loc.
 
 ## Etape (fiecare se testează înainte de următoarea)
-1. **M0** ✅ Toolchain + schelet: `bridger.exe` cu fereastră și tray, instanță unică, installer NSIS, build XP-compatibil verificat (`tools/check_xp_imports.py`).
+1. **M0** ✅ Toolchain + schelet: `nexus.exe` cu fereastră și tray, instanță unică, installer NSIS, build XP-compatibil verificat (`tools/check_xp_imports.py`).
 2. **M1** ✅ (testat pe Win11 contra unor parteneri falși; **netestat încă pe XP real**) Rețea + criptare + mouse/tastatură: margine, dublu-tap, urgență, reconectare. Teste: `build/link_test.exe` (în build), `tests/fake_main.c`, `tests/fake_controlled.c`.
 3. **M2** ✅ Clipboard text (testat pe Win11 în ambele sensuri cu `tests/fake_main.c`).
 4. **M3** ✅ Sunet (WASAPI pe Vista+, Stereo Mix pe XP). Testat pe Win11: captura cu `fake_main audio`, redarea cu `fake_controlled 3 tone`. **Stereo Mix pe XP netestat.**
 5. **M4** ✅ Transfer fișiere prin copy/paste (testat pe Win11 în ambele sensuri, inclusiv refuzul unei căi `..\`, cu `fake_main files`).
-6. **M5** Autoupdate: GitHub Releases → principal → controlați (inclusiv XP), cu installerul rulat silențios (`/S`).
+6. **M5** ✅ Autoupdate (`src/update.c`): principalul verifică `releases/latest` la un minut după pornire și apoi la 6 ore,
+   descarcă `Nexus-Setup-X.Y.Z.exe` în `%APPDATA%\Nexus\updates` și arată în sidebar „Install Nexus X.Y.Z”. Un click
+   trimite întâi installerul controlatului (dacă e în urmă), apoi îl rulează local cu `/S`; installerul închide Nexus și
+   îl repornește. Un controlat care se conectează mai târziu cu o versiune mai veche primește automat installerul
+   versiunii principalului (`UPDATE_BEGIN 17` [mărime u32][versiune], `UPDATE_DATA 18`, `UPDATE_END 19`). Controlatul
+   rulează doar o versiune mai nouă decât a lui și doar un fișier complet care începe cu `MZ`. HELLO poartă acum și
+   versiunea. Release-urile le face `.github/workflows/release.yml` la un tag `vX.Y.Z`. Pe Vista+, installerul cere
+   confirmarea UAC pe ecranul acelui PC; pe XP (cont de administrator) e silențios.
+   Testat pe Win11: primirea și rularea (`fake_main update`). **Netestat: descărcarea reală de pe GitHub (nu există încă un release).**
 7. **M6** Extra din Multiplicity, doar dacă le vrei: mai multe PC-uri controlate, blocare/screensaver
    sincronizat, controlat → principal în ambele sensuri.
 
@@ -96,5 +104,5 @@ iar la final `FILE_END 16`. Părinții vin înaintea conținutului. Receptorul s
 
 ## Limitări cunoscute
 - Pe un PC controlat cu Vista sau mai nou, inputul nu ajunge în ferestrele pornite ca administrator (UIPI)
-  cât timp Bridger rulează neelevat. Soluția: pornire elevată prin Task Scheduler la logare.
+  cât timp Nexus rulează neelevat. Soluția: pornire elevată prin Task Scheduler la logare.
 - Fără scroll în fereastra de setări: o pagină mai înaltă decât fereastra intră sub footer.
