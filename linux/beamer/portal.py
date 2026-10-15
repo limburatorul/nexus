@@ -110,7 +110,7 @@ class Portal:
 
     def token(self) -> str:
         self._count += 1
-        return f"beamer{self._count}"
+        return f"nexus{self._count}"
 
     def call(self, interface: str, method: str, signature: str = "", body: tuple = (), path: str = OBJECT_PATH):
         return self.bus.call(path, interface, method, signature, body)
