@@ -48,7 +48,8 @@ pe o grilă de 1,5 px, deci precizia e ±1 px.
 - Primul cadru în fiecare sens e `HELLO` cu numele PC-ului. Dacă nu se deschide, parolele diferă.
 - Mesaje: `HELLO 1`, `PING 2`/`PONG 3` (u32 ms, la fiecare secundă; 6 s de liniște = legătură căzută),
   `ENTER 4` [margine, păstrează-poziția, poziție u16], `LEAVE 5` [are-poziție, poziție u16],
-  `MOVE 6` [dx i16, dy i16], `BUTTON 7` [buton 1–5, apăsat], `WHEEL 8` [delta i16, orizontal], `KEY 9` [vk, scan, flaguri].
+  `MOVE 6` [dx i16, dy i16], `BUTTON 7` [buton 1–5, apăsat], `WHEEL 8` [delta i16, orizontal], `KEY 9` [vk, scan, flaguri],
+  `CLIPBOARD 10` [text UTF-8].
 - Audio va pleca separat, pe UDP, ca să nu fie blocat de un transfer de fișiere.
 
 **Sunet (controlat → principal):**
@@ -58,7 +59,7 @@ pe o grilă de 1,5 px, deci precizia e ±1 px.
 - Trimitem PCM 16-bit stereo la 44.1/48 kHz (~1.5 Mbit/s), fără codec, ceea ce e neglijabil în LAN.
   Principalul redă prin `waveOut`, cu un jitter buffer de ~60–100 ms.
 
-**Clipboard text:** la fiecare comutare, partea care pierde focusul trimite `CF_UNICODETEXT`.
+**Clipboard text:** la fiecare comutare, PC-ul care cedează inputul trimite `CF_UNICODETEXT` ca UTF-8 (`CLIPBOARD 10`), înaintea lui `ENTER`/`LEAVE`, dar numai dacă s-a schimbat de la ultima trimitere sau primire (`GetClipboardSequenceNumber`), ca textul să nu se întoarcă în ecou. UTF-8 invalid e ignorat. Textele peste 64 KB rămân pe loc.
 
 **Protocol:** e același pe toate versiunile de Windows și are un octet de versiune în handshake, deci principalul și controlatul trebuie doar să aibă aceeași versiune de protocol, nu aceeași versiune de Windows.
 
@@ -69,7 +70,7 @@ lipește unde vrei. Fișierele mai mari decât o limită din config nu se trimit
 ## Etape (fiecare se testează înainte de următoarea)
 1. **M0** ✅ Toolchain + schelet: `bridger.exe` cu fereastră și tray, instanță unică, installer NSIS, build XP-compatibil verificat (`tools/check_xp_imports.py`).
 2. **M1** ✅ (testat pe Win11 contra unor parteneri falși; **netestat încă pe XP real**) Rețea + criptare + mouse/tastatură: margine, dublu-tap, urgență, reconectare. Teste: `build/link_test.exe` (în build), `tests/fake_main.c`, `tests/fake_controlled.c`.
-3. **M2** Clipboard text.
+3. **M2** ✅ Clipboard text (testat pe Win11 în ambele sensuri cu `tests/fake_main.c`).
 4. **M3** Sunet (WASAPI pe Vista+, Stereo Mix pe XP).
 5. **M4** Transfer fișiere prin copy/paste.
 6. **M5** Autoupdate: GitHub Releases → principal → controlați (inclusiv XP), cu installerul rulat silențios (`/S`).

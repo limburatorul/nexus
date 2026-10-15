@@ -176,3 +176,13 @@ ws2_32.dll!setsockopt
 ws2_32.dll!shutdown
 ws2_32.dll!socket
 ws2_32.dll!wsastartup
+kernel32.dll!globalalloc
+kernel32.dll!globalfree
+kernel32.dll!globallock
+kernel32.dll!globalunlock
+user32.dll!closeclipboard
+user32.dll!emptyclipboard
+user32.dll!getclipboarddata
+user32.dll!getclipboardsequencenumber
+user32.dll!openclipboard
+user32.dll!setclipboarddata

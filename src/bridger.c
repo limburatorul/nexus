@@ -739,7 +739,8 @@ static void layout(void)
         y += S(40) + S(16);
         y = add_text(mx, y, mw,
                      L"The pointer arrives at the same height on the other screen. Crossing waits while a mouse "
-                     L"button is held, so a drag never gets split between the two PCs.",
+                     L"button is held, so a drag never gets split between the two PCs. Copied text comes "
+                     L"along when you cross.",
                      g.small, C_INK3);
         break;
     case PAGE_KEYBOARD:
@@ -964,9 +965,54 @@ static void quit(void)
     DestroyWindow(g.wnd);
 }
 
+/* ---- clipboard: the PC giving up input sends its text, so a copy there pastes here ---- */
+
+static DWORD clip_seq; /* the clipboard as Bridger last sent or set it: only a newer copy travels */
+
+static void clipboard_send(void)
+{
+    if (GetClipboardSequenceNumber() == clip_seq || !OpenClipboard(g.wnd)) return;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t *w = h ? GlobalLock(h) : NULL;
+    if (w) {
+        static unsigned char msg[LINK_MAX]; /* UI thread only */
+        /* ponytail: text over 64 KB stays behind; chunk it if that ever matters */
+        int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, (char *)msg + 1, LINK_MAX - 1, NULL, NULL);
+        GlobalUnlock(h);
+        msg[0] = MSG_CLIPBOARD;
+        if (n > 1) net_send(msg, n); /* n counts the NUL, which the type byte replaces */
+    }
+    CloseClipboard();
+    clip_seq = GetClipboardSequenceNumber();
+}
+
+static void clipboard_set(const unsigned char *s, int n)
+{
+    int wn = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)s, n, NULL, 0);
+    if (wn <= 0) return; /* not valid UTF-8: not from Bridger */
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (wn + 1) * sizeof(wchar_t));
+    if (!h) return;
+    wchar_t *w = GlobalLock(h);
+    MultiByteToWideChar(CP_UTF8, 0, (const char *)s, n, w, wn);
+    w[wn] = 0;
+    GlobalUnlock(h);
+    BOOL open = FALSE;
+    for (int i = 0; i < 10 && !(open = OpenClipboard(g.wnd)); i++) Sleep(20); /* another app may hold it a moment */
+    if (!open) {
+        GlobalFree(h);
+        return;
+    }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+    CloseClipboard();
+    clip_seq = GetClipboardSequenceNumber();
+}
+
 static void on_net_msg(unsigned char *msg, int len)
 {
-    if (msg[0] == MSG_PONG && len == 5) {
+    if (msg[0] == MSG_CLIPBOARD && len > 1) {
+        clipboard_set(msg + 1, len - 1);
+    } else if (msg[0] == MSG_PONG && len == 5) {
         DWORD sent = msg[1] | msg[2] << 8 | msg[3] << 16 | (DWORD)msg[4] << 24;
         g.rtt = (int)(GetTickCount() - sent);
         RECT r = {0, 0, S(SIDEBAR), S(STATUS_H)};
@@ -977,6 +1023,7 @@ static void on_net_msg(unsigned char *msg, int len)
         unsigned char out[8];
         BOOL was = input_controlled_active();
         int n = input_replay(msg, len, out);
+        if (was && !input_controlled_active()) clipboard_send(); /* ahead of LEAVE, so it is there on arrival */
         if (n) net_send(out, n);
         if (was != input_controlled_active()) refresh();
     }
@@ -1067,6 +1114,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     case WM_INPUT_SEND: {
         unsigned char msg[8];
         int n = input_pack((UINT)wp, lp, msg);
+        if (wp == MSG_ENTER) clipboard_send();
         if (n) net_send(msg, n);
         return 0;
     }
