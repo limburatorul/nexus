@@ -6,19 +6,30 @@
 clipboard-ul și fișierele copiate te urmează, iar sunetul PC-ului controlat se aude pe boxele
 PC-ului principal.
 
-> **Stare:** în lucru, versiunea 0.2: mouse, tastatură, clipboard, sunet, fișiere și update automat. Testată mai ales pe Windows 11; planul și stadiul sunt în [SPEC.md](SPEC.md).
+> **Stare:** în lucru, versiunea 0.2: mouse, tastatură, clipboard, sunet, fișiere, update automat și descoperire în rețea, pe Windows (XP–11) și Linux (Wayland). Testată automat între Windows 11, XP și Kubuntu; planul și stadiul sunt în [SPEC.md](SPEC.md).
 
 ## Sisteme suportate
 
-| Rol | Windows |
-|---|---|
-| PC principal (are tastatura și mouse-ul) | 7, 8, 10, 11 (XP merge și el) |
-| PC controlat | XP SP3, Vista, 7, 8, 10, 11 |
+| Rol | Windows | Linux |
+|---|---|---|
+| PC principal (are tastatura și mouse-ul) | 7, 8, 10, 11 (XP merge și el) | KDE Plasma 6.1+ / GNOME 45+ pe Wayland |
+| PC controlat | XP SP3, Vista, 7, 8, 10, 11 | idem |
 
 Același `Nexus-Setup-<versiune>.exe` merge pe toate. Pe XP, sunetul se captează prin intrarea
 „Stereo Mix” / „What U Hear” a plăcii de sunet, dacă driverul o are.
 
-## Build
+## Linux
+
+Python 3.10+ cu PySide6, PyNaCl și jeepney, plus `libei` și `parec`/`pacat` (pachete de sistem):
+
+```sh
+python3 -m venv ~/nexus-venv && ~/nexus-venv/bin/pip install PySide6-Essentials pynacl jeepney
+cd linux && ~/nexus-venv/bin/python -m nexus
+```
+
+La prima pornire desktopul cere permisiunea de a controla tastatura și mouse-ul.
+
+## Build (Windows)
 
 1. [WinLibs](https://winlibs.com) MinGW-w64 **i686**, cu runtime **msvcrt** (nu UCRT). Îl pui în
    `%USERPROFILE%\tools\mingw32` sau setezi variabila `MINGW` spre acel folder.

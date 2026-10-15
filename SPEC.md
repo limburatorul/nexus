@@ -92,17 +92,29 @@ iar la final `FILE_END 16`. Părinții vin înaintea conținutului. Receptorul s
    rulează doar o versiune mai nouă decât a lui și doar un fișier complet care începe cu `MZ`. HELLO poartă acum și
    versiunea. Release-urile le face `.github/workflows/release.yml` la un tag `vX.Y.Z`. Pe Vista+, installerul cere
    confirmarea UAC pe ecranul acelui PC; pe XP (cont de administrator) e silențios.
-   Testat pe Win11: primirea și rularea (`fake_main update`). **Netestat: descărcarea reală de pe GitHub (nu există încă un release).**
-7. **M6** Extra din Multiplicity, doar dacă le vrei: mai multe PC-uri controlate, blocare/screensaver
+   Testat pe Win11: primirea și rularea (`fake_main update`) și descărcarea reală a release-ului v0.2.0 de pe GitHub.
+7. **Descoperire în rețea** ✅ UDP 24802: `"NXUS?"` întreabă, fiecare Nexus răspunde `"NXUS!"` + rol + versiune + NUL + nume.
+   Principalul întreabă la 3 s (și pe fiecare /24 local, fiindcă Windows trimite 255.255.255.255 pe un singur adaptor);
+   pe pagina Connection apar PC-urile controlate găsite, un click completează adresa. Nimic din răspuns nu e secret.
+8. **Linux** (Python + PySide6, `linux/nexus`), refolosind back-end-urile Wayland din Beamer (`linux/beamer`):
+   - controlat: injectare și clipboard prin portalul RemoteDesktop (cere permisiunea o dată, apoi token);
+   - principal: captură prin portalul InputCapture (KDE 6.6 are doar v1, fără token: **cere permisiunea la fiecare pornire**);
+   - sunet prin `parec`/`pacat` (PipeWire sau PulseAudio), fișierele copiate ca `text/uri-list`;
+   - aceeași fereastră, aceleași pagini și același mod de test ca pe Windows. **X11 netestat.**
+9. **Teste automate** (`tests/driver.py`): `nexus /test` (Windows) și `python -m nexus --test` (Linux) rulează un
+   profil separat (`test.ini`, port 24810, fără cârlige) și primesc comenzi pe 24811, autentificate cu cheia legăturii.
+   Driverul verifică text ↔, cursor și fișiere ↔ între oricare două PC-uri. Trec: Win11 → XP, Win11 → Kubuntu, Kubuntu → XP.
+10. **M6** Extra din Multiplicity, doar dacă le vrei: mai multe PC-uri controlate, blocare/screensaver
    sincronizat, controlat → principal în ambele sensuri.
 
 ## Nu facem (cel puțin în v1)
 - Ctrl+Alt+Del către PC-ul controlat: cere un serviciu Windows sau winlogon. Pentru asta folosim combinația de urgență.
 - Ecranul de logon / UAC securizat pe controlat: același motiv.
 - Efectele grafice din Beamer.
-- Descoperirea automată în rețea: deocamdată adresa PC-ului controlat se scrie de mână.
 
 ## Limitări cunoscute
 - Pe un PC controlat cu Vista sau mai nou, inputul nu ajunge în ferestrele pornite ca administrator (UIPI)
   cât timp Nexus rulează neelevat. Soluția: pornire elevată prin Task Scheduler la logare.
 - Fără scroll în fereastra de setări: o pagină mai înaltă decât fereastra intră sub footer.
+- Linux principal pe Wayland: fără scurtătură pentru a trece (nu există hook global de taste); se trece prin margine,
+  iar înapoi cu dublu-tap Right Ctrl sau Ctrl+Alt+Pause, cât timp inputul e capturat.

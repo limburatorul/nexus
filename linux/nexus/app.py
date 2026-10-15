@@ -71,6 +71,7 @@ class Controller(QObject):
     """Everything Nexus does, on the Qt thread; the network, sound and portal threads report here."""
 
     changed = Signal()
+    crossed = Signal()  # from the capture thread: input went over, the clipboard follows
     _status = Signal(int)
     _message = Signal(bytes)
     _note = Signal(str)
@@ -89,7 +90,8 @@ class Controller(QObject):
         self.files = Files(self._send, self._note.emit, self._files_done.emit)
         self.session = net.Session(self.cfg, self.name, VERSION, self.port, self._status.emit, self._message.emit,
                                    files=self.files)
-        self.capture = sound.Capture(self._send, self._audio.emit)
+        self.sound_capture = sound.Capture(self._send, self._audio.emit)
+        self.capture = None  # the main PC's input capture, made when it is the main PC
         self.player = sound.Player()
         self.discovery = Discovery(TEST_DISCOVERY_PORT if test else DISCOVERY_PORT, self.name, VERSION,
                                    lambda: 0 if self.cfg.role == "main" else 1, self._found.emit)
@@ -102,16 +104,26 @@ class Controller(QObject):
         self._found.connect(self.changed)
         self._audio.connect(self.on_audio)
         self._command.connect(self._run_command, Qt.BlockingQueuedConnection)
+        self.crossed.connect(self.send_clipboard)
+        self.send = self._send
         self.timer = QTimer(self, interval=1000, timeout=self.tick)
 
     def start(self) -> None:
         self.injector.start()  # also the clipboard's way in, on either role
+        self.start_capture()
         self.session.start()
         self.discovery.start()
         self.timer.start()
         if self.test:
             from .control import Control
             Control(lambda: self.cfg.key, self.name, VERSION, self.command).start()
+
+    def start_capture(self) -> None:
+        """On a main PC: the desktop asks once for leave to capture input at the edge."""
+        if self.cfg.role == "main" and self.capture is None:
+            from .capture import Capture
+            self.capture = Capture(self)
+            self.capture.start()
 
     def _send(self, msg: bytes) -> bool:
         return self.session.send(msg)
@@ -121,13 +133,15 @@ class Controller(QObject):
     @Slot(int)
     def on_status(self, status: int) -> None:
         if status != net.CONNECTED:
+            if self.capture:
+                self.capture.home(None, tell=False)
             self.rtt, self.remote, self.audio_state = None, False, 0
             self.injector.release_all()
             self.injector.active = False
-            self.capture.stop()
+            self.sound_capture.stop()
             self.player.stop()
         elif self.cfg.role == "controlled":
-            self.capture.start()
+            self.sound_capture.start()
         self.status = status
         self.changed.emit()
 
@@ -141,6 +155,8 @@ class Controller(QObject):
             self.changed.emit()
         elif self.cfg.role == "main":
             if kind == link.LEAVE and len(msg) == 4:
+                if self.capture:
+                    self.capture.home(msg[2] | msg[3] << 8 if msg[1] else None, tell=False)
                 self.remote = False
                 self.changed.emit()
             elif kind == link.AUDIO:
@@ -206,6 +222,7 @@ class Controller(QObject):
             setattr(self.cfg, k, v)
         self.cfg.save()
         self.session.restart()
+        self.start_capture()
         self.changed.emit()
 
     # ---- test mode ----
@@ -259,6 +276,8 @@ class Controller(QObject):
         elif verb == "found":
             return "|".join("%s %s %s" % (ip, "main" if r == 0 else "controlled", n)
                             for ip, (n, r, _s) in self.discovery.found.items())
+        elif verb == "push":
+            return "pushed" if self.capture and self.capture.push() else "no capture to push through"
         elif verb == "portal":
             r = self.injector.remote
             return "ready=%s clipboard=%s problem=%s offered=%s ours=%s changes=%s" % (
