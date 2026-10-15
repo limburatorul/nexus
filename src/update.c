@@ -131,6 +131,9 @@ static void check(void)
                 if (size > 2 && exe[0] == 'M' && exe[1] == 'Z') { /* a Windows program, not an error page */
                     lstrcpynW(dir, path, MAX_PATH);
                     *wcsrchr(dir, L'\\') = 0;
+                    *wcsrchr(dir, L'\\') = 0;
+                    CreateDirectoryW(dir, NULL); /* %APPDATA%\Nexus, in case the config was never saved */
+                    wcscat(dir, L"\\updates");
                     CreateDirectoryW(dir, NULL);
                     _snwprintf(part, MAX_PATH, L"%ls.part", path);
                     HANDLE f = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
