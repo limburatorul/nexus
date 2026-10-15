@@ -24,8 +24,8 @@ jobs:
         run: |
           $url = "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-msvcrt-r2/winlibs-i686-posix-dwarf-gcc-16.2.0-mingw-w64msvcrt-14.0.0-r2.zip"
           Invoke-WebRequest $url -OutFile mingw.zip
-          Expand-Archive mingw.zip -DestinationPath C:\
-          "MINGW=C:\mingw32" | Out-File $env:GITHUB_ENV -Append
+          Expand-Archive mingw.zip -DestinationPath C:\winlibs  # the runner already has a C:\mingw32
+          "MINGW=C:\winlibs\mingw32" | Out-File $env:GITHUB_ENV -Append
 
       - name: NSIS
         run: choco install nsis -y --no-progress
