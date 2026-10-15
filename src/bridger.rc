@@ -1,0 +1,34 @@
+#include <windows.h>
+#include "resource.h"
+#include "version.h"
+
+IDI_APP ICON "../res/bridger.ico"
+
+IDR_FONT_REGULAR RCDATA "../res/fonts/HankenGrotesk-Regular.ttf"
+IDR_FONT_SEMIBOLD RCDATA "../res/fonts/HankenGrotesk-SemiBold.ttf"
+IDR_FONT_BOLD RCDATA "../res/fonts/HankenGrotesk-Bold.ttf"
+IDR_FONT_MONO RCDATA "../res/fonts/B612Mono-Regular.ttf"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION VER_MAJOR, VER_MINOR, VER_PATCH, 0
+PRODUCTVERSION VER_MAJOR, VER_MINOR, VER_PATCH, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Bridger"
+      VALUE "FileDescription", "Bridger - keyboard, mouse and sound across PCs"
+      VALUE "FileVersion", BRIDGER_VERSION
+      VALUE "ProductName", "Bridger"
+      VALUE "ProductVersion", BRIDGER_VERSION
+      VALUE "LegalCopyright", "GPL-3.0-or-later"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
