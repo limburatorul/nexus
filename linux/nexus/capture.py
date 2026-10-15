@@ -49,7 +49,7 @@ class Capture:
 
     def push(self) -> bool:
         """Tests: push the pointer through the edge with injected motion, as Beamer's shortcut does."""
-        return self.hooks.push_through(self.models(), lambda: None, lambda: None)
+        return self.hooks.push_through(self.models(), self._cross, lambda: None)
 
     # ---- the capture thread's callbacks ----
 

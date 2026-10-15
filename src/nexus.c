@@ -1633,6 +1633,8 @@ static void test_command(const char *cmd, char *out)
         long size;
         unsigned long h = fnv(warg, &size);
         _snprintf(out, cap, "%ld %08lx", size, h);
+    } else if (!strncmp(cmd, "hooks", 5)) {
+        input_debug(out, cap);
     } else if (!strncmp(cmd, "found", 5)) {
         int at = 0;
         out[0] = 0;
@@ -1740,7 +1742,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     /* WS_EX_CONTROLPARENT + IsDialogMessage give Tab/Shift+Tab between the controls. */
     CreateWindowExW(WS_EX_CONTROLPARENT, g.app_class, g.test ? L"Nexus (test)" : L"Nexus", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                     CW_USEDEFAULT, CW_USEDEFAULT, S(1000), S(800), NULL, NULL, inst, NULL);
-    if (!g.test) input_main_start(g.wnd); /* a test instance leaves this PC's mouse and keys alone */
+    /* A test instance leaves this PC's mouse and keys alone, unless a test VM asks for real hooks. */
+    if (!g.test || wcsstr(cmd, L"/hooks")) input_main_start(g.wnd);
     files_init(g.wnd, net_send);
     if (g.test) CloseHandle(CreateThread(NULL, 0, test_thread, NULL, 0, NULL));
     else update_start(g.wnd, is_main_pc);

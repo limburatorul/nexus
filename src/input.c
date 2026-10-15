@@ -5,6 +5,7 @@
 
 #include "link.h" /* winsock2.h before windows.h */
 #include "input.h"
+#include <stdio.h>
 
 #define HT_SET (WM_APP + 1)   /* wParam: connected, lParam: edge */
 #define HT_LEAVE (WM_APP + 2) /* wParam: 0, or 1 + position along the edge (0..65535) */
@@ -51,6 +52,7 @@ static struct {
     BYTE down[256], passdown[256];
     POINT park, back;
     DWORD last_tap;
+    DWORD mouse_events, key_events, last_vk, last_flags; /* for the test mode's "hooks" */
 } m;
 
 static void post(UINT type, DWORD packed) { PostMessageW(m.ui, WM_INPUT_SEND, type, (LPARAM)packed); }
@@ -90,6 +92,7 @@ static BOOL at_edge(POINT p)
 static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
 {
     MSLLHOOKSTRUCT *e = (MSLLHOOKSTRUCT *)lp;
+    m.mouse_events++;
     if (code < 0 || (e->flags & LLMHF_INJECTED)) return CallNextHookEx(NULL, code, wp, lp);
     int btn = 0, down = 0;
     switch (wp) {
@@ -125,6 +128,7 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
 static LRESULT CALLBACK key_hook(int code, WPARAM wp, LPARAM lp)
 {
     KBDLLHOOKSTRUCT *e = (KBDLLHOOKSTRUCT *)lp;
+    m.key_events++, m.last_vk = e->vkCode, m.last_flags = e->flags;
     if (code < 0 || (e->flags & LLKHF_INJECTED)) return CallNextHookEx(NULL, code, wp, lp);
     BYTE vk = (BYTE)e->vkCode;
     BOOL up = (e->flags & LLKHF_UP) != 0, repeat = !up && m.down[vk];
@@ -218,6 +222,12 @@ void input_main_set(BOOL connected, int edge)
 }
 
 void input_main_leave(int frac) { PostThreadMessageW(m.thread, HT_LEAVE, frac < 0 ? 0 : frac + 1, 0); }
+
+void input_debug(char *out, int cap)
+{
+    _snprintf(out, cap, "hooks=%d mouse=%lu keys=%lu last_vk=%02lx flags=%02lx remote=%d connected=%d",
+              m.thread != 0, m.mouse_events, m.key_events, m.last_vk, m.last_flags, m.remote, m.connected);
+}
 
 int input_pack(UINT type, LPARAM packed, unsigned char *o)
 {

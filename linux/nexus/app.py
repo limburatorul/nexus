@@ -640,6 +640,10 @@ def main() -> None:
     import logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     test = "--test" in sys.argv
+    if test:  # kill -USR1 prints every thread's stack to the log, for hangs
+        import faulthandler
+        import signal
+        faulthandler.register(signal.SIGUSR1)
     app = QApplication(sys.argv)
     app.setApplicationName("Nexus")
     app.setDesktopFileName("nexus")
