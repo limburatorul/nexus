@@ -7,7 +7,7 @@
 
 /* Posted to the UI window; a pointer in lParam is malloc'd and freed by whoever handles it. */
 #define WM_UPDATE_READY (WM_APP + 30)  /* lParam: char* version whose installer is downloaded */
-#define WM_UPDATE_PUSHED (WM_APP + 31) /* wParam: TRUE when the installer reached the other PC */
+#define WM_UPDATE_PUSHED (WM_APP + 31) /* wParam: TRUE when the installer reached the other PC, lParam: which */
 #define WM_UPDATE_RUN (WM_APP + 32)    /* lParam: wchar_t* installer received from the main PC */
 
 int version_cmp(const char *a, const char *b); /* <0, 0, >0 like strcmp, for "1.2.3" */
@@ -16,8 +16,8 @@ int version_cmp(const char *a, const char *b); /* <0, 0, >0 like strcmp, for "1.
 void update_start(HWND ui, BOOL (*is_main)(void));
 /* The downloaded installer for version, if there is one. */
 BOOL update_installer(const char *version, wchar_t path[MAX_PATH]);
-/* Sends that installer over the link on a background thread; WM_UPDATE_PUSHED reports the end. */
-BOOL update_push(const char *version, BOOL (*send)(const unsigned char *msg, int len));
+/* Sends that installer to PC `to` on a background thread; WM_UPDATE_PUSHED reports the end. */
+BOOL update_push(const char *version, BOOL (*send)(int to, const unsigned char *msg, int len), int to);
 /* Runs an installer silently; it closes this Nexus, installs and starts the new one. */
 void update_run(const wchar_t *installer);
 

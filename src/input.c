@@ -7,8 +7,8 @@
 #include "input.h"
 #include <stdio.h>
 
-#define HT_SET (WM_APP + 1)   /* wParam: connected, lParam: edge */
-#define HT_LEAVE (WM_APP + 2) /* wParam: 0, or 1 + position along the edge (0..65535) */
+#define HT_SET (WM_APP + 1)   /* wParam: some PC connected, lParam: edges that lead to one */
+#define HT_LEAVE (WM_APP + 2) /* wParam: 0, or 1 + position along the edge (0..65535); lParam: edge, -1: where it left */
 #define TAP_MS 400
 
 static RECT vscreen(void)
@@ -48,7 +48,7 @@ static struct {
     HWND ui, hider;
     DWORD thread;
     BOOL connected, remote, tap_clean;
-    int edge, buttons;
+    int edges, buttons; /* edges: bit per edge of this screen that leads to a connected PC */
     BYTE down[256], passdown[256];
     POINT park, back;
     DWORD last_tap;
@@ -57,12 +57,13 @@ static struct {
 
 static void post(UINT type, DWORD packed) { PostMessageW(m.ui, WM_INPUT_SEND, type, (LPARAM)packed); }
 
-static void enter(POINT from, BOOL keep)
+/* The UI thread picks the PC: the one past that edge, or for the shortcut (keep) the one used last. */
+static void enter(POINT from, BOOL keep, int edge)
 {
     m.remote = TRUE;
     m.back = from;
     m.tap_clean = FALSE;
-    post(MSG_ENTER, m.edge | (DWORD)keep << 4 | (DWORD)(keep ? 0 : along(vscreen(), from, m.edge)) << 8);
+    post(MSG_ENTER, edge | (DWORD)keep << 4 | (DWORD)(keep ? 0 : along(vscreen(), from, edge)) << 8);
     m.park.x = GetSystemMetrics(SM_CXSCREEN) / 2;
     m.park.y = GetSystemMetrics(SM_CYSCREEN) / 2;
     SetWindowPos(m.hider, HWND_TOPMOST, m.park.x - 32, m.park.y - 32, 64, 64, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -78,15 +79,14 @@ static void leave_local(POINT to)
     PostMessageW(m.ui, WM_INPUT_STATE, FALSE, 0);
 }
 
-static BOOL at_edge(POINT p)
+/* Which edge leading to a connected PC the pointer touches, or -1. */
+static int at_edge(POINT p)
 {
     RECT v = vscreen();
-    switch (m.edge) {
-    case EDGE_LEFT: return p.x <= v.left;
-    case EDGE_RIGHT: return p.x >= v.right - 1;
-    case EDGE_TOP: return p.y <= v.top;
-    default: return p.y >= v.bottom - 1;
-    }
+    BOOL on[4] = {p.x <= v.left, p.x >= v.right - 1, p.y <= v.top, p.y >= v.bottom - 1};
+    for (int e = 0; e < 4; e++)
+        if (on[e] && m.edges & 1 << e) return e;
+    return -1;
 }
 
 static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
@@ -108,8 +108,8 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
     if (!m.remote) {
         if (btn) m.buttons = down ? m.buttons | 1 << btn : m.buttons & ~(1 << btn);
         /* Never cross mid-drag: the button would stay down here and arrive up-only there. */
-        else if (wp == WM_MOUSEMOVE && m.connected && !m.buttons && at_edge(e->pt)) {
-            enter(e->pt, FALSE);
+        else if (wp == WM_MOUSEMOVE && !m.buttons && at_edge(e->pt) >= 0) {
+            enter(e->pt, FALSE, at_edge(e->pt));
             return 1;
         }
         return CallNextHookEx(NULL, code, wp, lp);
@@ -145,7 +145,7 @@ static LRESULT CALLBACK key_hook(int code, WPARAM wp, LPARAM lp)
                 } else if (!m.buttons) {
                     POINT p;
                     GetCursorPos(&p);
-                    enter(p, TRUE);
+                    enter(p, TRUE, 0);
                 }
                 return 1;
             }
@@ -195,10 +195,11 @@ static DWORD WINAPI hook_thread(void *ready)
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         if (msg.message == HT_SET) {
             m.connected = (BOOL)msg.wParam;
-            m.edge = (int)msg.lParam;
+            m.edges = m.connected ? (int)msg.lParam : 0;
             if (!m.connected && m.remote) leave_local(m.back);
         } else if (msg.message == HT_LEAVE) {
-            if (m.remote) leave_local(msg.wParam ? on_edge(vscreen(), m.edge, (int)msg.wParam - 1) : m.back);
+            int edge = (int)msg.lParam;
+            if (m.remote) leave_local(msg.wParam && edge >= 0 ? on_edge(vscreen(), edge, (int)msg.wParam - 1) : m.back);
         } else {
             DispatchMessageW(&msg);
         }
@@ -216,12 +217,15 @@ void input_main_start(HWND ui)
     CloseHandle(ready);
 }
 
-void input_main_set(BOOL connected, int edge)
+void input_main_set(BOOL connected, int edges)
 {
-    if (m.thread) PostThreadMessageW(m.thread, HT_SET, connected, edge);
+    if (m.thread) PostThreadMessageW(m.thread, HT_SET, connected, edges);
 }
 
-void input_main_leave(int frac) { PostThreadMessageW(m.thread, HT_LEAVE, frac < 0 ? 0 : frac + 1, 0); }
+void input_main_leave(int edge, int frac)
+{
+    if (m.thread) PostThreadMessageW(m.thread, HT_LEAVE, frac < 0 ? 0 : frac + 1, edge);
+}
 
 void input_debug(char *out, int cap)
 {
@@ -247,8 +251,8 @@ int input_pack(UINT type, LPARAM packed, unsigned char *o)
 /* ---- controlled PC ---- */
 
 static struct {
-    BOOL active;
-    int ret_edge, buttons;
+    BOOL active, tell_edge; /* tell_edge: the main PC names the edge each LEAVE went through */
+    int exits, buttons;     /* exits: bit per edge of this screen that leads to another PC */
     POINT pos; /* tracked here: GetCursorPos lags behind SendInput */
     BYTE keys[256], scan[256], ext[256];
 } c;
@@ -293,15 +297,18 @@ void input_release_all(void)
 
 BOOL input_controlled_active(void) { return c.active; }
 
-int input_replay(const unsigned char *msg, int len, unsigned char out[8])
+int input_replay(const unsigned char *msg, int len, unsigned char leave[8])
 {
     RECT v = vscreen();
-    if (msg[0] == MSG_ENTER && len == 5 && msg[1] <= EDGE_BOTTOM) {
-        c.ret_edge = msg[1] ^ 1; /* the main PC's right edge leads in at this PC's left, and so on */
+    if (msg[0] == MSG_ENTER && (len == 5 || len == 6) && msg[1] <= EDGE_BOTTOM) {
+        int in = msg[1] ^ 1; /* moving right, the pointer comes in at this PC's left, and so on */
+        /* A main PC before 0.3 knows one PC only: the way in is the way back. */
+        c.exits = len == 6 ? msg[5] & 15 : 1 << in;
+        c.tell_edge = len == 6;
         if (msg[2]) {
             GetCursorPos(&c.pos);
         } else {
-            c.pos = on_edge(v, c.ret_edge, msg[3] | msg[4] << 8);
+            c.pos = on_edge(v, in, msg[3] | msg[4] << 8);
             SetCursorPos(c.pos.x, c.pos.y);
         }
         c.active = TRUE;
@@ -316,17 +323,16 @@ int input_replay(const unsigned char *msg, int len, unsigned char out[8])
 
     if (msg[0] == MSG_MOVE && len == 5) {
         int dx = (short)(msg[1] | msg[2] << 8), dy = (short)(msg[3] | msg[4] << 8);
-        BOOL out_edge = (c.ret_edge == EDGE_LEFT && c.pos.x <= v.left && dx < 0) ||
-                        (c.ret_edge == EDGE_RIGHT && c.pos.x >= v.right - 1 && dx > 0) ||
-                        (c.ret_edge == EDGE_TOP && c.pos.y <= v.top && dy < 0) ||
-                        (c.ret_edge == EDGE_BOTTOM && c.pos.y >= v.bottom - 1 && dy > 0);
-        if (out_edge) { /* pushed through the return edge: input goes home at the same height */
-            int f = along(v, c.pos, c.ret_edge);
-            input_release_all();
-            c.active = FALSE;
-            out[0] = MSG_LEAVE, out[1] = 1, out[2] = (BYTE)f, out[3] = (BYTE)(f >> 8);
-            return 4;
-        }
+        BOOL out[4] = {c.pos.x <= v.left && dx < 0, c.pos.x >= v.right - 1 && dx > 0, c.pos.y <= v.top && dy < 0,
+                       c.pos.y >= v.bottom - 1 && dy > 0};
+        for (int e = 0; e < 4; e++)
+            if (out[e] && c.exits & 1 << e) { /* pushed through an edge to another PC: input goes there */
+                int f = along(v, c.pos, e);
+                input_release_all();
+                c.active = FALSE;
+                leave[0] = MSG_LEAVE, leave[1] = 1, leave[2] = (BYTE)f, leave[3] = (BYTE)(f >> 8), leave[4] = (BYTE)e;
+                return c.tell_edge ? 5 : 4;
+            }
         c.pos.x = max(v.left, min(v.right - 1, c.pos.x + dx));
         c.pos.y = max(v.top, min(v.bottom - 1, c.pos.y + dy));
         INPUT in = {0};

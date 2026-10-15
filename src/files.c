@@ -15,7 +15,7 @@
 #define CHUNK 32768
 
 static HWND ui;
-static BOOL (*link_out)(const unsigned char *, int);
+static BOOL (*link_out)(int to, const unsigned char *, int);
 
 static void note(const wchar_t *fmt, ...)
 {
@@ -41,7 +41,7 @@ typedef struct {
     wchar_t **paths;
     int n;
     wchar_t peer[64];
-    int count;
+    int to, count;
     LONGLONG total, sent;
     int last_pct;
     BOOL ok;
@@ -95,7 +95,7 @@ static void send_item(Batch *b, const wchar_t *path, int rel_from, BOOL dir, LON
     m[1] = (unsigned char)dir;
     put64(m + 2, dir ? 0 : size);
     int n = WideCharToMultiByte(CP_UTF8, 0, path + rel_from, -1, (char *)m + 10, 1024, NULL, NULL);
-    b->ok = n > 1 && link_out(m, 10 + n - 1);
+    b->ok = n > 1 && link_out(b->to, m, 10 + n - 1);
     for (LONGLONG left = dir ? 0 : size; b->ok && left > 0;) {
         DWORD got = 0;
         if (!ReadFile(f, m + 1, (DWORD)(left < CHUNK ? left : CHUNK), &got, NULL) || !got) {
@@ -103,7 +103,7 @@ static void send_item(Batch *b, const wchar_t *path, int rel_from, BOOL dir, LON
             break;
         }
         m[0] = MSG_FILE_DATA;
-        b->ok = link_out(m, 1 + (int)got);
+        b->ok = link_out(b->to, m, 1 + (int)got);
         left -= got, b->sent += got;
         int pct = b->total ? (int)(b->sent * 100 / b->total) : 100;
         if (pct / 10 != b->last_pct / 10) note(L"Sending to %ls\x2026 %d%%", b->peer, pct), b->last_pct = pct;
@@ -125,13 +125,13 @@ static DWORD WINAPI send_thread(void *p)
         for (int i = 0; i < 4; i++) begin[1 + i] = (unsigned char)(b->count >> (8 * i));
         put64(begin + 5, b->total);
         note(L"Sending %d item%ls (%ls) to %ls\x2026", b->count, b->count == 1 ? L"" : L"s", size, b->peer);
-        b->ok = link_out(begin, 13);
+        b->ok = link_out(b->to, begin, 13);
         for (int i = 0; i < b->n && b->ok; i++) {
             const wchar_t *slash = wcsrchr(b->paths[i], L'\\');
             walk(b, b->paths[i], slash ? (int)(slash - b->paths[i]) + 1 : 0, send_item);
         }
         unsigned char end = MSG_FILE_END;
-        if (b->ok) b->ok = link_out(&end, 1);
+        if (b->ok) b->ok = link_out(b->to, &end, 1);
         if (b->ok) note(L"Sent %d item%ls (%ls) to %ls.", b->count, b->count == 1 ? L"" : L"s", size, b->peer);
         else note(L"Sending to %ls stopped part way; copy the files again to retry.", b->peer);
     }
@@ -142,7 +142,7 @@ static DWORD WINAPI send_thread(void *p)
     return 0;
 }
 
-BOOL files_send(HDROP drop, const wchar_t *peer)
+BOOL files_send(HDROP drop, const wchar_t *peer, int to)
 {
     if (InterlockedCompareExchange(&sending, 1, 0)) return FALSE;
     Batch *b = calloc(1, sizeof *b);
@@ -153,6 +153,7 @@ BOOL files_send(HDROP drop, const wchar_t *peer)
         DragQueryFileW(drop, i, b->paths[i], MAX_PATH);
     }
     lstrcpynW(b->peer, peer, 64);
+    b->to = to;
     b->last_pct = -10;
     HANDLE t = CreateThread(NULL, 0, send_thread, b, 0, NULL);
     if (t) CloseHandle(t);
@@ -310,7 +311,7 @@ void files_receive(const unsigned char *m, int len)
     else if (m[0] == MSG_FILE_END && len == 1) end();
 }
 
-void files_init(HWND w, BOOL (*send)(const unsigned char *, int))
+void files_init(HWND w, BOOL (*send)(int, const unsigned char *, int))
 {
     ui = w;
     link_out = send;

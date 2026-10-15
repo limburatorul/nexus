@@ -255,3 +255,12 @@ msvcrt.dll!strchr
 ws2_32.dll!htonl
 ws2_32.dll!recvfrom
 ws2_32.dll!sendto
+msvcrt.dll!atoi
+msvcrt.dll!wcstol
+user32.dll!getdlgctrlid
+user32.dll!getwindowrect
+user32.dll!mapwindowpoints
+user32.dll!offsetrect
+user32.dll!releasecapture
+user32.dll!screentoclient
+user32.dll!setcapture

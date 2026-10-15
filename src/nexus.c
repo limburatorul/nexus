@@ -22,8 +22,8 @@
 #define WM_TRAY (WM_APP + 1)
 #define WM_NEXUS_QUIT (WM_APP + 2) /* sent by the installer before it overwrites the exe */
 #define WM_NEXUS_SHOW (WM_APP + 3) /* sent by a second instance */
-#define WM_NET_STATUS (WM_APP + 4)   /* wParam: NS_* */
-#define WM_NET_MSG (WM_APP + 5)      /* wParam: length, lParam: malloc'd message, freed here */
+#define WM_NET_STATUS (WM_APP + 4)   /* wParam: NS_*, lParam: which PC */
+#define WM_NET_MSG (WM_APP + 5)      /* wParam: length, lParam: malloc'd PC number + message, freed here */
 #define WM_AUDIO_STATE (WM_APP + 6)  /* wParam: AUDIO_* of this controlled PC */
 #define WM_TEST (WM_APP + 7)         /* wParam: command, lParam: reply buffer (test mode) */
 #define TEST_LINK_PORT 24810         /* a test profile beside the real one, see "/test" */
@@ -32,12 +32,17 @@
 #define TEST_DISCOVERY_PORT 24812
 #define WM_FOUND (WM_APP + 8)        /* lParam: malloc'd Found, freed here */
 #define MAX_FOUND 4
+#define MAX_PEERS 4 /* controlled PCs a main PC works with */
+#define THIS_PC MAX_PEERS /* this PC, where a PC number goes */
+#define MAP_W 5 /* the map: this PC in the middle of a 5 x 3 grid */
+#define MAP_H 3
 #define TIMER_PING 1
 
 enum { ID_TRAY_OPEN = 1, ID_TRAY_QUIT, ID_NAV0 = 100, ID_QUIT = 200, ID_SITE, ID_SETUP, ID_ROLE0, ID_ROLE1,
-       ID_EDGE0, ID_EDGE3 = ID_EDGE0 + 3, ID_PASSWORD, ID_PEER, ID_PASSWORD_LABEL, ID_PEER_LABEL, ID_UPDATE, ID_FOUND0,
-       ID_FOUND3 = ID_FOUND0 + MAX_FOUND - 1 };
-enum { K_NAV, K_OUTLINE, K_LINK, K_SEGMENT };
+       ID_PASSWORD, ID_PASSWORD_LABEL, ID_UPDATE, ID_FOUND0, ID_FOUND3 = ID_FOUND0 + MAX_FOUND - 1,
+       ID_ADDR0, ID_ADDR3 = ID_ADDR0 + MAX_PEERS - 1, ID_ADDR_LABEL0, ID_ADDR_LABEL3 = ID_ADDR_LABEL0 + MAX_PEERS - 1,
+       ID_TILE0, ID_TILE3 = ID_TILE0 + MAX_PEERS - 1 };
+enum { K_NAV, K_OUTLINE, K_LINK, K_SEGMENT, K_TILE };
 enum { ROLE_MAIN, ROLE_CONTROLLED };
 typedef struct { char ip[16]; wchar_t name[32]; int role; DWORD seen; } Found;
 enum { PAGE_OVERVIEW, PAGE_CROSSING, PAGE_KEYBOARD, PAGE_SOUND, PAGE_FILES, PAGE_CONNECTION };
@@ -56,16 +61,16 @@ static const Palette LIGHT = {
 enum { C_INK, C_INK2, C_INK3, C_SIGNAL, C_AMBER, C_FAULT, C_OFF };
 
 static const struct { const wchar_t *name, *title, *desc, *eyebrow; } PAGES[] = {
-    {L"Overview", L"OVERVIEW", L"The PC this one works with, where input is right now, and how the link is doing.",
-     L"MACHINE"},
+    {L"Overview", L"OVERVIEW", L"The PCs this one works with, where input is right now, and how the links are doing.",
+     L"MACHINES"},
     {L"Crossing", L"CROSSING",
-     L"Which edge of this screen leads to the controlled PC. Push the pointer through it to cross, and back "
-     L"through the facing edge over there to return.",
-     L"EDGE"},
+     L"Where the PCs stand around this screen. Push the pointer through an edge to cross to the PC beside it, "
+     L"and on from there to the next one.",
+     L"MAP"},
     {L"Keyboard", L"KEYBOARD", L"Switch without the mouse, and a way home that always works.", L"SHORTCUTS"},
     {L"Sound", L"SOUND", L"The controlled PC's sound, played on this PC's speakers.", L"SOUND"},
-    {L"Files", L"FILES", L"Copy files on one PC, switch, and paste them on the other.", L"FILES"},
-    {L"Connection", L"CONNECTION", L"This PC's role, the password both PCs share, and where to find the other one.",
+    {L"Files", L"FILES", L"Copy files on one PC, switch, and paste them on another.", L"FILES"},
+    {L"Connection", L"CONNECTION", L"This PC's role, the password all the PCs share, and where to find the others.",
      L"THIS PC"},
 };
 #define NPAGES ((int)(sizeof PAGES / sizeof PAGES[0]))
@@ -87,14 +92,33 @@ static const wchar_t *STATUS_NOTE[] = {
     L"Another program uses port 24800, so the main PC cannot connect to this one.",
     L""};
 static const wchar_t *EDGE_NAMES[] = {L"left", L"right", L"top", L"bottom"};
+static const int DIR_X[] = {-1, 1, 0, 0}, DIR_Y[] = {0, 0, -1, 1}; /* a step through each edge */
+
+/* A controlled PC: where it is (config), its link (network threads) and what the UI shows of it. */
+typedef struct {
+    wchar_t addr[128]; /* empty: a free slot */
+    int x, y;          /* its cell on the map, this PC at 0,0 */
+    SOCKET conn;       /* under g.cs */
+    CRITICAL_SECTION send_cs; /* one sender at a time, without holding up the other PCs */
+    Link link;
+    BOOL link_up;      /* link and link_up under send_cs */
+    HANDLE wake;
+    wchar_t name[64];  /* from the handshake, under g.cs */
+    char version[16];  /* "" from a Nexus too old to say */
+    int status, rtt, audio_state; /* UI thread */
+} Peer;
 
 typedef struct { int kind; RECT r; const wchar_t *s; HFONT f; int color; HWND edit; } Label;
-enum { L_TEXT, L_LINE, L_DOT, L_WELL, L_KEYCAP };
+enum { L_TEXT, L_LINE, L_DOT, L_WELL, L_KEYCAP, L_CELL, L_HOME }; /* L_CELL, L_HOME: the map */
 
 static struct {
     HINSTANCE inst;
     HWND found_btn[MAX_FOUND];
-    HWND wnd, hover, nav[NPAGES], quit, site, update, setup, role[2], edge[4], pw, peer, pw_label, peer_label;
+    HWND wnd, hover, nav[NPAGES], quit, site, update, setup, role[2], pw, pw_label;
+    HWND addr[MAX_PEERS], addr_label[MAX_PEERS], tile[MAX_PEERS];
+    RECT map_rc; /* the map on the Crossing page */
+    int drag;    /* the tile being dragged, -1 for none */
+    POINT grab;  /* where in that tile it was grabbed */
     WNDPROC button_proc;
     NOTIFYICONDATAW tray;
     UINT taskbar_created;
@@ -107,30 +131,27 @@ static struct {
     int nlabels;
     wchar_t ini[MAX_PATH], addresses[128], line[256], note[256];
 
-    /* config: written by the UI thread, read by the network thread under cs */
-    struct { int role, edge; wchar_t peer[128]; unsigned char key[32]; BOOL has_key; } cfg;
+    /* config: written by the UI thread, read by the network threads under cs */
+    struct { int role; unsigned char key[32]; BOOL has_key; } cfg;
+    Peer peer[MAX_PEERS]; /* a controlled PC uses peer[0] for its main PC */
 
     /* network */
     CRITICAL_SECTION cs;
-    HANDLE wake;
-    SOCKET conn, listener;
-    Link link;
-    BOOL link_up;
+    SOCKET listener;
     int gen;
     char my_name[64];
+    wchar_t my_name_w[64];
     BOOL test; /* started with /test: own profile and ports, no hooks, driven over TEST_CONTROL_PORT */
     int port, discovery_port;
     SOCKET discovery;
     Found found[MAX_FOUND]; /* other Nexus PCs answering on this network */
     unsigned long local_ip[4], broadcast[4];
     const wchar_t *app_class;
-    wchar_t peer_name[64];
-    char peer_version[16]; /* "" from a Nexus too old to say */
 
-    /* UI view of the link */
-    int status, rtt;
-    BOOL remote; /* main: input is on the controlled PC */
-    int audio_state; /* AUDIO_*: how the controlled PC captures its sound */
+    /* UI view of the links */
+    BOOL remote; /* main: input is on a controlled PC */
+    int target;  /* main: the PC with input, -1 while it is here */
+    int last;    /* main: the PC input went to last, for the shortcut and for sound */
     wchar_t files_note[256]; /* the latest transfer, for the Files page */
     char update_version[16]; /* a newer Nexus downloaded and ready to install */
     wchar_t update_note[256];
@@ -140,10 +161,49 @@ static struct {
 static int S(int px) { return MulDiv(px, g.dpi, 96); }
 static void redraw(const RECT *r);
 static void test_command(const char *cmd, char *out);
+static void move_peer(int pc, int x, int y);
+static int cell_w, cell_h; /* a map cell, set by layout() */
 
 static const int SIDEBAR = 280, FOOTER = 96, NAV_H = 52, STATUS_H = 132;
 
 /* ---- config ---- */
+
+static const wchar_t *PEER_KEY[MAX_PEERS] = {L"peer", L"peer2", L"peer3", L"peer4"};
+static const wchar_t *PLACE_KEY[MAX_PEERS] = {L"place", L"place2", L"place3", L"place4"};
+
+/* ---- the map: controlled PCs on a grid around this one ---- */
+
+static BOOL on_map(int x, int y) { return x >= -MAP_W / 2 && x <= MAP_W / 2 && y >= -MAP_H / 2 && y <= MAP_H / 2; }
+
+/* Who stands in a cell: a PC number, THIS_PC, or -1. */
+static int peer_at(int x, int y)
+{
+    if (!x && !y) return THIS_PC;
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (g.peer[i].addr[0] && g.peer[i].x == x && g.peer[i].y == y) return i;
+    return -1;
+}
+
+/* Who is past an edge of a PC (THIS_PC for this one). */
+static int neighbour(int pc, int edge)
+{
+    int x = pc == THIS_PC ? 0 : g.peer[pc].x, y = pc == THIS_PC ? 0 : g.peer[pc].y;
+    return peer_at(x + DIR_X[edge], y + DIR_Y[edge]);
+}
+
+/* A cell for a newly added PC: beside this one first. */
+static void free_cell(int pc)
+{
+    static const int order[][2] = {{1, 0}, {-1, 0}, {0, -1}, {0, 1}, {2, 0}, {-2, 0}, {1, -1}, {1, 1},
+                                   {-1, -1}, {-1, 1}, {2, -1}, {2, 1}, {-2, -1}, {-2, 1}};
+    for (int i = 0; i < (int)(sizeof order / sizeof order[0]); i++) {
+        int who = peer_at(order[i][0], order[i][1]);
+        if (who < 0 || who == pc) {
+            g.peer[pc].x = order[i][0], g.peer[pc].y = order[i][1];
+            return;
+        }
+    }
+}
 
 static void config_load(void)
 {
@@ -155,11 +215,21 @@ static void config_load(void)
 
     GetPrivateProfileStringW(L"nexus", L"role", L"main", v, 128, g.ini);
     g.cfg.role = lstrcmpiW(v, L"controlled") == 0 ? ROLE_CONTROLLED : ROLE_MAIN;
+    /* Before 0.3 there was one controlled PC, on the side named by "edge". */
     GetPrivateProfileStringW(L"nexus", L"edge", L"right", v, 128, g.ini);
-    g.cfg.edge = EDGE_RIGHT;
+    int edge = EDGE_RIGHT;
     for (int i = 0; i < 4; i++)
-        if (lstrcmpiW(v, EDGE_NAMES[i]) == 0) g.cfg.edge = i;
-    GetPrivateProfileStringW(L"nexus", L"peer", L"", g.cfg.peer, 128, g.ini);
+        if (lstrcmpiW(v, EDGE_NAMES[i]) == 0) edge = i;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        Peer *p = &g.peer[i];
+        GetPrivateProfileStringW(L"nexus", PEER_KEY[i], L"", p->addr, 128, g.ini);
+        GetPrivateProfileStringW(L"nexus", PLACE_KEY[i], L"", v, 128, g.ini);
+        wchar_t *comma;
+        p->x = (int)wcstol(v, &comma, 10); /* "x,y"; 0,0 is this PC's cell, so a bad place gets a free one */
+        p->y = *comma == L',' ? (int)wcstol(comma + 1, NULL, 10) : 0;
+        if (!v[0] && i == 0) p->x = DIR_X[edge], p->y = DIR_Y[edge];
+        if (p->addr[0] && (!on_map(p->x, p->y) || peer_at(p->x, p->y) != i)) free_cell(i);
+    }
     GetPrivateProfileStringW(L"nexus", L"key", L"", v, 128, g.ini);
     g.cfg.has_key = wcslen(v) == 64;
     for (int i = 0; g.cfg.has_key && i < 64; i++) {
@@ -172,38 +242,84 @@ static void config_load(void)
 
 static void config_save(void)
 {
-    wchar_t hex[65] = L"";
+    wchar_t hex[65] = L"", place[16];
     for (int i = 0; g.cfg.has_key && i < 32; i++) _snwprintf(hex + 2 * i, 3, L"%02x", g.cfg.key[i]);
     WritePrivateProfileStringW(L"nexus", L"role", g.cfg.role == ROLE_CONTROLLED ? L"controlled" : L"main", g.ini);
-    WritePrivateProfileStringW(L"nexus", L"edge", EDGE_NAMES[g.cfg.edge], g.ini);
-    WritePrivateProfileStringW(L"nexus", L"peer", g.cfg.peer, g.ini);
+    WritePrivateProfileStringW(L"nexus", L"edge", NULL, g.ini);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        _snwprintf(place, 16, L"%d,%d", g.peer[i].x, g.peer[i].y);
+        place[15] = 0;
+        WritePrivateProfileStringW(L"nexus", PEER_KEY[i], g.peer[i].addr[0] ? g.peer[i].addr : NULL, g.ini);
+        WritePrivateProfileStringW(L"nexus", PLACE_KEY[i], g.peer[i].addr[0] ? place : NULL, g.ini);
+    }
     /* The stretched key, never the password itself. */
     WritePrivateProfileStringW(L"nexus", L"key", hex, g.ini);
 }
 
-static BOOL configured(void) { return g.cfg.has_key && (g.cfg.role == ROLE_CONTROLLED || g.cfg.peer[0]); }
-
-/* ---- network thread ---- */
-
-static void net_status(int st) { PostMessageW(g.wnd, WM_NET_STATUS, st, 0); }
-
-static BOOL net_send(const unsigned char *msg, int len)
+static int peer_count(void)
 {
-    EnterCriticalSection(&g.cs);
-    BOOL ok = g.link_up && link_send(&g.link, msg, len);
-    LeaveCriticalSection(&g.cs);
+    int n = 0;
+    for (int i = 0; i < MAX_PEERS; i++) n += g.peer[i].addr[0] != 0;
+    return n;
+}
+
+static BOOL configured(void) { return g.cfg.has_key && (g.cfg.role == ROLE_CONTROLLED || peer_count()); }
+
+static BOOL up(int pc) { return pc == THIS_PC || (pc >= 0 && g.peer[pc].status == NS_CONNECTED); }
+
+/* The edges of a PC (THIS_PC for this one) that lead to a PC that is there. */
+static int exits(int pc)
+{
+    int mask = 0;
+    for (int e = 0; e < 4; e++) {
+        int n = neighbour(pc, e);
+        if (n >= 0 && up(n)) mask |= 1 << e;
+    }
+    return mask;
+}
+
+static int first_connected(void)
+{
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (g.peer[i].addr[0] && up(i)) return i;
+    return -1;
+}
+
+/* The PC whose sound plays here: the one input went to last, else the first one there. */
+static int sound_from(void) { return g.last >= 0 && up(g.last) ? g.last : first_connected(); }
+
+static const wchar_t *name_of(int pc)
+{
+    if (pc < 0 || pc >= MAX_PEERS) return g.cfg.role == ROLE_MAIN ? L"the controlled PC" : L"the main PC";
+    return g.peer[pc].name[0] ? g.peer[pc].name : g.peer[pc].addr[0] ? g.peer[pc].addr : L"the main PC";
+}
+
+/* ---- network threads: one per controlled PC on the main PC, one for the main PC on a controlled one ---- */
+
+static void net_status(int pc, int st) { PostMessageW(g.wnd, WM_NET_STATUS, st, pc); }
+
+static BOOL net_send(int pc, const unsigned char *msg, int len)
+{
+    if (pc < 0 || pc >= MAX_PEERS) return FALSE;
+    Peer *p = &g.peer[pc];
+    EnterCriticalSection(&p->send_cs);
+    BOOL ok = p->link_up && link_send(&p->link, msg, len);
+    LeaveCriticalSection(&p->send_cs);
     return ok;
 }
 
-/* Drops the current connection and makes the network thread re-read the config. */
-static void net_restart(void)
+/* Drops a PC's connection (-1: all of them) and makes its thread re-read the config. */
+static void net_restart(int pc)
 {
     EnterCriticalSection(&g.cs);
     g.gen++;
-    if (g.conn != INVALID_SOCKET) shutdown(g.conn, SD_BOTH);
-    if (g.listener != INVALID_SOCKET) closesocket(g.listener), g.listener = INVALID_SOCKET;
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (pc < 0 || pc == i) {
+            if (g.peer[i].conn != INVALID_SOCKET) shutdown(g.peer[i].conn, SD_BOTH);
+            SetEvent(g.peer[i].wake);
+        }
+    if (pc <= 0 && g.listener != INVALID_SOCKET) closesocket(g.listener), g.listener = INVALID_SOCKET;
     LeaveCriticalSection(&g.cs);
-    SetEvent(g.wake);
 }
 
 static SOCKET dial(const char *host)
@@ -251,14 +367,15 @@ static SOCKET listen_socket(void)
 }
 
 /* Runs one connection: handshake, then every message goes to the UI thread, pings answered here. */
-static int session(SOCKET s, int role, const unsigned char key[32])
+static int session(int pc, SOCKET s, int role, const unsigned char key[32])
 {
+    Peer *p = &g.peer[pc];
     BOOL on = TRUE;
     DWORD timeout = 6000; /* both ends ping every second; silence this long means the link is gone */
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *)&on, sizeof on);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof timeout);
     EnterCriticalSection(&g.cs);
-    g.conn = s;
+    p->conn = s;
     LeaveCriticalSection(&g.cs);
 
     Link l;
@@ -266,35 +383,43 @@ static int session(SOCKET s, int role, const unsigned char key[32])
     int r = link_handshake(&l, s, role == ROLE_MAIN, key, g.my_name, NEXUS_VERSION, peer, peer_version);
     if (r == LINK_OK) {
         EnterCriticalSection(&g.cs);
-        g.link = l;
-        g.link_up = TRUE;
-        MultiByteToWideChar(CP_UTF8, 0, peer, -1, g.peer_name, 64);
-        lstrcpynA(g.peer_version, peer_version, 16);
+        MultiByteToWideChar(CP_UTF8, 0, peer, -1, p->name, 64);
+        lstrcpynA(p->version, peer_version, 16);
         LeaveCriticalSection(&g.cs);
-        net_status(NS_CONNECTED);
-        unsigned char *buf = malloc(LINK_MAX);
+        EnterCriticalSection(&p->send_cs);
+        p->link = l;
+        p->link_up = TRUE;
+        LeaveCriticalSection(&p->send_cs);
+        net_status(pc, NS_CONNECTED);
+        unsigned char *buf = malloc(1 + LINK_MAX);
         int n;
-        while ((n = link_recv(&l, buf, LINK_MAX)) > 0) {
-            if (buf[0] == MSG_PING && n == 5) {
-                buf[0] = MSG_PONG;
-                net_send(buf, 5);
-            } else if (buf[0] >= MSG_UPDATE_BEGIN && buf[0] <= MSG_UPDATE_END) {
-                if (role == ROLE_CONTROLLED) update_receive(buf, n);
-            } else if (buf[0] >= MSG_FILE_BEGIN && buf[0] <= MSG_FILE_END) {
-                files_receive(buf, n); /* written to disk here, so a big copy never queues up in memory */
+        while ((n = link_recv(&l, buf + 1, LINK_MAX)) > 0) {
+            unsigned char *m = buf + 1;
+            if (m[0] == MSG_PING && n == 5) {
+                m[0] = MSG_PONG;
+                net_send(pc, m, 5);
+            } else if (m[0] >= MSG_UPDATE_BEGIN && m[0] <= MSG_UPDATE_END) {
+                if (role == ROLE_CONTROLLED) update_receive(m, n);
+            } else if (m[0] >= MSG_FILE_BEGIN && m[0] <= MSG_FILE_END) {
+                files_receive(m, n); /* written to disk here, so a big copy never queues up in memory */
             } else {
-                unsigned char *copy = malloc(n);
-                memcpy(copy, buf, n);
+                unsigned char *copy = malloc(1 + n);
+                copy[0] = (unsigned char)pc;
+                memcpy(copy + 1, m, n);
                 PostMessageW(g.wnd, WM_NET_MSG, n, (LPARAM)copy);
             }
         }
         free(buf);
+        /* ponytail: one incoming transfer at a time for all links; files only travel with input,
+         * which is in one place, so two PCs never send at once */
         files_abort();
         update_abort();
     }
+    EnterCriticalSection(&p->send_cs);
+    p->link_up = FALSE;
+    LeaveCriticalSection(&p->send_cs);
     EnterCriticalSection(&g.cs);
-    g.link_up = FALSE;
-    g.conn = INVALID_SOCKET;
+    p->conn = INVALID_SOCKET;
     closesocket(s);
     LeaveCriticalSection(&g.cs);
     switch (r) {
@@ -408,51 +533,56 @@ static BOOL discovery_expire(void) /* PCs not heard from for 10 s are gone */
     return changed;
 }
 
-static DWORD WINAPI net_thread(void *unused)
+static DWORD WINAPI net_thread(void *arg)
 {
-    (void)unused;
+    int pc = (int)(INT_PTR)arg;
+    Peer *p = &g.peer[pc];
     int gen = -1, sticky = 0; /* the last failure stays on screen until the next success or a config change */
     for (;;) {
         EnterCriticalSection(&g.cs);
-        int role = g.cfg.role, ready = configured();
+        int role = g.cfg.role;
+        /* A controlled PC has one main PC: this thread's job only for the first slot. */
+        BOOL ready = g.cfg.has_key && (role == ROLE_MAIN ? p->addr[0] != 0 : pc == 0);
         unsigned char key[32];
         char host[128];
         memcpy(key, g.cfg.key, 32);
-        WideCharToMultiByte(CP_ACP, 0, g.cfg.peer, -1, host, sizeof host, NULL, NULL);
+        WideCharToMultiByte(CP_ACP, 0, p->addr, -1, host, sizeof host, NULL, NULL);
         if (gen != g.gen) gen = g.gen, sticky = 0;
         LeaveCriticalSection(&g.cs);
 
         if (!ready) {
-            net_status(NS_SETUP);
-            WaitForSingleObject(g.wake, INFINITE);
+            net_status(pc, NS_SETUP);
+            WaitForSingleObject(p->wake, INFINITE);
             continue;
         }
         SOCKET s;
         if (role == ROLE_MAIN) {
-            EnterCriticalSection(&g.cs);
-            if (g.listener != INVALID_SOCKET) closesocket(g.listener), g.listener = INVALID_SOCKET;
-            LeaveCriticalSection(&g.cs);
-            net_status(sticky ? sticky : NS_CONNECTING);
+            if (pc == 0) {
+                EnterCriticalSection(&g.cs);
+                if (g.listener != INVALID_SOCKET) closesocket(g.listener), g.listener = INVALID_SOCKET;
+                LeaveCriticalSection(&g.cs);
+            }
+            net_status(pc, sticky ? sticky : NS_CONNECTING);
             s = dial(host);
             if (s == INVALID_SOCKET) {
-                net_status(sticky = NS_UNREACHABLE);
-                WaitForSingleObject(g.wake, 3000);
+                net_status(pc, sticky = NS_UNREACHABLE);
+                WaitForSingleObject(p->wake, 3000);
                 continue;
             }
         } else {
             SOCKET ls = listen_socket();
             if (ls == INVALID_SOCKET) {
-                net_status(NS_PORT);
-                WaitForSingleObject(g.wake, 3000);
+                net_status(pc, NS_PORT);
+                WaitForSingleObject(p->wake, 3000);
                 continue;
             }
-            net_status(sticky ? sticky : NS_WAITING);
+            net_status(pc, sticky ? sticky : NS_WAITING);
             s = accept(ls, NULL, NULL);
             if (s == INVALID_SOCKET) continue; /* the listener was closed for a config change */
         }
-        sticky = session(s, role, key);
-        if (sticky) net_status(sticky);
-        if (sticky || role == ROLE_MAIN) WaitForSingleObject(g.wake, sticky ? 3000 : 500);
+        sticky = session(pc, s, role, key);
+        if (sticky) net_status(pc, sticky);
+        if (sticky || role == ROLE_MAIN) WaitForSingleObject(p->wake, sticky ? 3000 : 500);
     }
     return 0;
 }
@@ -529,9 +659,29 @@ static COLORREF color(int c)
 
 /* ---- status text ---- */
 
-static int status_color(void)
+/* The state shown for this PC as a whole: connected while any controlled PC is, else the first one's. */
+static int overall(void)
 {
-    switch (g.status) {
+    if (g.cfg.role == ROLE_CONTROLLED) return g.peer[0].status;
+    if (!configured()) return NS_SETUP;
+    if (first_connected() >= 0) return NS_CONNECTED;
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (g.peer[i].addr[0]) return g.peer[i].status;
+    return NS_SETUP;
+}
+
+/* The PC the sidebar talks about: where input is, else the one used last, else the first one there. */
+static int shown_peer(void)
+{
+    if (g.cfg.role == ROLE_CONTROLLED) return 0;
+    if (g.target >= 0) return g.target;
+    if (g.last >= 0 && up(g.last)) return g.last;
+    return first_connected();
+}
+
+static int status_color_of(int st)
+{
+    switch (st) {
     case NS_CONNECTED: return C_SIGNAL;
     case NS_SETUP: case NS_WAITING: case NS_CONNECTING: return C_OFF;
     case NS_UNREACHABLE: return C_AMBER;
@@ -539,14 +689,17 @@ static int status_color(void)
     }
 }
 
+static int status_color(void) { return status_color_of(overall()); }
+
 /* g.line: the short status word for the sidebar; g.note: the sentence for the Overview card. */
 static void status_text(void)
 {
-    const wchar_t *name = g.peer_name[0] ? g.peer_name : L"the other PC";
-    if (g.status != NS_CONNECTED) {
-        lstrcpynW(g.line, STATUS_WORD[g.status], 256);
-        lstrcpynW(g.note, STATUS_NOTE[g.status], 256);
-    } else if (g.remote) {
+    int st = overall();
+    const wchar_t *name = name_of(shown_peer());
+    if (st != NS_CONNECTED) {
+        lstrcpynW(g.line, STATUS_WORD[st], 256);
+        lstrcpynW(g.note, STATUS_NOTE[st], 256);
+    } else if (g.remote && g.target >= 0) {
         _snwprintf(g.line, 256, L"Input on %ls", name);
         _snwprintf(g.note, 256, L"Input is on %ls. Push back through its edge, double-tap Right Ctrl, "
                                 L"or press Ctrl+Alt+Pause to return.", name);
@@ -555,10 +708,10 @@ static void status_text(void)
         _snwprintf(g.note, 256, L"%ls is driving this PC.", name);
     } else {
         lstrcpynW(g.line, L"Connected", 256);
-        _snwprintf(g.note, 256, g.cfg.role == ROLE_MAIN ? L"Connected to %ls. Push the pointer through the %ls edge "
-                                                          L"or double-tap Right Ctrl to cross."
-                                                        : L"Connected to %ls, the main PC.",
-                   name, EDGE_NAMES[g.cfg.edge]);
+        if (g.cfg.role == ROLE_MAIN)
+            lstrcpynW(g.note, L"Push the pointer through an edge that leads to another PC (the Crossing page "
+                              L"shows which), or double-tap Right Ctrl to cross.", 256);
+        else _snwprintf(g.note, 256, L"Connected to %ls, the main PC.", name);
     }
     g.line[255] = g.note[255] = 0;
     _snwprintf(g.tray.szTip, 64, L"Nexus: %ls", g.line);
@@ -676,6 +829,39 @@ static void draw_icon(HDC dc, int page, int x, int y, COLORREF c)
 
 static LRESULT CALLBACK button_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
+    int id = GetDlgCtrlID(w);
+    if (id >= ID_TILE0 && id <= ID_TILE3) { /* a PC on the map: dragged to another cell */
+        int pc = id - ID_TILE0;
+        if (m == WM_LBUTTONDOWN) {
+            SetFocus(w);
+            SetCapture(w);
+            g.drag = pc;
+            g.grab.x = (short)LOWORD(lp), g.grab.y = (short)HIWORD(lp);
+            return 0;
+        }
+        if (m == WM_MOUSEMOVE && g.drag == pc) {
+            POINT pt;
+            RECT r;
+            GetCursorPos(&pt);
+            ScreenToClient(g.wnd, &pt);
+            GetWindowRect(w, &r);
+            MoveWindow(w, pt.x - g.grab.x, pt.y - g.grab.y, r.right - r.left, r.bottom - r.top, TRUE);
+            return 0;
+        }
+        if ((m == WM_LBUTTONUP || m == WM_CAPTURECHANGED) && g.drag == pc) {
+            g.drag = -1;
+            if (m == WM_LBUTTONUP) ReleaseCapture();
+            RECT r;
+            GetWindowRect(w, &r);
+            MapWindowPoints(NULL, g.wnd, (POINT *)&r, 2);
+            int cx = (r.left + r.right) / 2 - g.map_rc.left, cy = (r.top + r.bottom) / 2 - g.map_rc.top;
+            /* Dropped off the map, or capture lost: back to its cell. */
+            if (m == WM_LBUTTONUP && cx >= 0 && cy >= 0 && cx < MAP_W * cell_w && cy < MAP_H * cell_h)
+                move_peer(pc, cx / cell_w - MAP_W / 2, cy / cell_h - MAP_H / 2);
+            else move_peer(pc, g.peer[pc].x, g.peer[pc].y);
+            return 0;
+        }
+    }
     if (m == WM_MOUSEMOVE && g.hover != w) {
         HWND old = g.hover;
         TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, w, 0};
@@ -716,12 +902,7 @@ static HWND add_field(const wchar_t *label, int label_id, int id, DWORD style, H
     return e;
 }
 
-static BOOL is_selected(int id)
-{
-    if (id == ID_ROLE0 || id == ID_ROLE1) return id - ID_ROLE0 == g.cfg.role;
-    if (id >= ID_EDGE0 && id <= ID_EDGE3) return id - ID_EDGE0 == g.cfg.edge;
-    return FALSE;
-}
+static BOOL is_selected(int id) { return (id == ID_ROLE0 || id == ID_ROLE1) && id - ID_ROLE0 == g.cfg.role; }
 
 static void draw_control(const DRAWITEMSTRUCT *d)
 {
@@ -743,7 +924,8 @@ static void draw_control(const DRAWITEMSTRUCT *d)
         int kind = (int)GetWindowLongPtrW(d->hwndItem, GWLP_USERDATA);
         BOOL hover = d->hwndItem == g.hover || (d->itemState & ODS_SELECTED);
         BOOL focus = (d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT);
-        BOOL in_module = kind == K_SEGMENT || d->CtlID == ID_SETUP || (d->CtlID >= ID_FOUND0 && d->CtlID <= ID_FOUND3);
+        BOOL in_module = kind == K_SEGMENT || kind == K_TILE || d->CtlID == ID_SETUP ||
+                         (d->CtlID >= ID_FOUND0 && d->CtlID <= ID_FOUND3);
         COLORREF bg = in_module ? p->panel : p->ground;
         fill(dc, &r, bg);
         if (kind == K_NAV) {
@@ -765,6 +947,15 @@ static void draw_control(const DRAWITEMSTRUCT *d)
             if (sel) round_rect(dc, &b, S(5), p->ink, p->ink, S(1));
             else round_rect(dc, &b, S(5), hover ? p->well : bg, hover ? p->ink2 : p->edge, S(1));
             text(dc, label, r, g.button, sel ? p->ground : p->ink, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        } else if (kind == K_TILE) {
+            const Peer *pp = &g.peer[d->CtlID - ID_TILE0];
+            RECT b = {0, 0, w, h}, t;
+            round_rect(dc, &b, S(6), hover ? p->rule : p->well, hover ? p->ink2 : p->edge, S(1));
+            dot(dc, S(12), S(15), S(8), color(status_color_of(pp->status)));
+            SetRect(&t, S(26), S(8), w - S(8), S(30));
+            text(dc, label, t, g.button, p->ink, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            SetRect(&t, S(12), S(30), w - S(8), S(50));
+            text(dc, pp->addr, t, g.small, p->ink3, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         } else {
             COLORREF c = d->CtlID == ID_UPDATE ? p->signal : hover ? p->ink : p->ink3;
             text(dc, label, r, d->CtlID == ID_UPDATE ? g.button : g.small, c, DT_SINGLELINE | DT_VCENTER);
@@ -815,13 +1006,31 @@ static int add_field_row(int x, int y, int w, HWND label, HWND edit, const wchar
     return add_text(x, y, w, hint, g.small, C_INK3) + S(20);
 }
 
+/* "through this PC's right edge and XP's top edge": the edges that lead to a PC on the map. */
+static void ways_in(int pc, wchar_t *out, int cap)
+{
+    int at = 0;
+    out[0] = 0;
+    for (int e = 0; e < 4; e++) {
+        int n = neighbour(pc, e);
+        if (n < 0) continue;
+        const wchar_t *who = n == THIS_PC ? L"this PC" : name_of(n);
+        at += _snwprintf(out + at, cap - at, L"%ls%ls's %ls edge", at ? L" and " : L"", who, EDGE_NAMES[e ^ 1]);
+        if (at < 0 || at >= cap) break;
+    }
+    out[cap - 1] = 0;
+}
+
 static void layout(void)
 {
-    static wchar_t detail[192], address_line[192];
-    HWND page_controls[] = {g.setup, g.role[0], g.role[1], g.edge[0], g.edge[1], g.edge[2], g.edge[3],
-                            g.pw, g.peer, g.pw_label, g.peer_label, g.found_btn[0], g.found_btn[1], g.found_btn[2],
-                            g.found_btn[3]};
+    static wchar_t detail[MAX_PEERS + 1][192], address_line[192], ledger[MAX_PEERS][256];
+    HWND page_controls[] = {g.setup, g.role[0], g.role[1], g.pw, g.pw_label, g.found_btn[0], g.found_btn[1],
+                            g.found_btn[2], g.found_btn[3]};
     for (int i = 0; i < (int)(sizeof page_controls / sizeof page_controls[0]); i++) ShowWindow(page_controls[i], SW_HIDE);
+    for (int i = 0; i < MAX_PEERS; i++) {
+        ShowWindow(g.addr[i], SW_HIDE), ShowWindow(g.addr_label[i], SW_HIDE);
+        if (g.drag != i) ShowWindow(g.tile[i], SW_HIDE);
+    }
 
     RECT c;
     GetClientRect(g.wnd, &c);
@@ -863,42 +1072,76 @@ static void layout(void)
             y += S(44);
             break;
         }
-        add_label(L_DOT, mx, y + S(7), S(10), S(10), NULL, NULL, status_color(), NULL);
-        add_label(L_LINE, mx + S(22), y, mw - S(22), S(24),
-                  g.status == NS_CONNECTED && g.peer_name[0] ? g.peer_name : main_pc ? g.cfg.peer : L"Main PC",
-                  g.status_font, C_INK, NULL);
-        y += S(30);
-        if (main_pc) _snwprintf(detail, 192, L"Controlled PC  ·  %ls  ·  port %d", g.cfg.peer, g.port);
-        else _snwprintf(detail, 192, L"Main PC  ·  connects to this PC on port %d", g.port);
-        detail[191] = 0;
-        add_label(L_LINE, mx, y, mw, S(22), detail, g.body, C_INK3, NULL);
-        y += S(30);
+        for (int i = 0; i < MAX_PEERS; i++) {
+            const Peer *p = &g.peer[i];
+            if (main_pc ? !p->addr[0] : i > 0) continue;
+            add_label(L_DOT, mx, y + S(7), S(10), S(10), NULL, NULL, status_color_of(p->status), NULL);
+            add_label(L_LINE, mx + S(22), y, mw - S(22), S(24),
+                      p->status == NS_CONNECTED || main_pc ? name_of(i) : L"Main PC", g.status_font, C_INK, NULL);
+            y += S(28);
+            if (main_pc) _snwprintf(detail[i], 192, L"Controlled PC  \x00b7  %ls  \x00b7  %ls", p->addr, STATUS_WORD[p->status]);
+            else _snwprintf(detail[i], 192, L"Main PC  \x00b7  connects to this PC on port %d", g.port);
+            detail[i][191] = 0;
+            add_label(L_LINE, mx, y, mw, S(22), detail[i], g.body, C_INK3, NULL);
+            y += S(36);
+        }
         y = add_text(mx, y, mw, g.note, g.body, C_INK2);
         if (g.update_note[0]) y = add_text(mx, y + S(12), mw, g.update_note, g.body, C_INK);
         break;
     case PAGE_CROSSING:
         if (!main_pc) {
             y = add_text(mx, y, mw,
-                         L"The edge is chosen on the main PC. Push the pointer back through the edge of this "
-                         L"screen that faces it to return input there.",
+                         L"The main PC arranges the PCs. Push the pointer through an edge of this screen that has "
+                         L"a PC beside it on the main PC's map to go there.",
                          g.body, C_INK2);
             break;
         }
-        y = add_text(mx, y, mw, L"The controlled PC sits on this side of this screen:", g.body, C_INK2) + S(14);
-        for (int i = 0; i < 4; i++) place(g.edge[i], mx + i * S(118), y, S(110), S(40));
-        y += S(40) + S(16);
-        y = add_text(mx, y, mw,
-                     L"The pointer arrives at the same height on the other screen. Crossing waits while a mouse "
-                     L"button is held, so a drag never gets split between the two PCs. Copied text comes "
-                     L"along when you cross.",
+        if (!peer_count()) {
+            y = add_text(mx, y, mw, L"Add a controlled PC on the Connection page; it then shows up here.", g.body,
+                         C_INK2);
+            break;
+        }
+        /* The map: this PC in the middle cell, the others where they were dragged. */
+        cell_w = min(S(150), mw / MAP_W), cell_h = cell_w * 3 / 5;
+        SetRect(&g.map_rc, mx, y, mx + MAP_W * cell_w, y + MAP_H * cell_h);
+        for (int cy = 0; cy < MAP_H; cy++)
+            for (int cx = 0; cx < MAP_W; cx++) {
+                int gx = cx - MAP_W / 2, gy = cy - MAP_H / 2, who = peer_at(gx, gy);
+                int l = g.map_rc.left + cx * cell_w + S(4), t = g.map_rc.top + cy * cell_h + S(4);
+                if (who == THIS_PC)
+                    add_label(L_HOME, l, t, cell_w - S(8), cell_h - S(8), L"This PC", g.button, C_INK, NULL);
+                else if (who < 0)
+                    add_label(L_CELL, l, t, cell_w - S(8), cell_h - S(8), NULL, NULL, 0, NULL);
+                else if (g.drag != who) {
+                    SetWindowTextW(g.tile[who], name_of(who));
+                    place(g.tile[who], l, t, cell_w - S(8), cell_h - S(8));
+                }
+            }
+        y = g.map_rc.bottom + S(20);
+        for (int i = 0; i < MAX_PEERS; i++) {
+            if (!g.peer[i].addr[0]) continue;
+            wchar_t ways[192];
+            ways_in(i, ways, 192);
+            if (ways[0]) _snwprintf(ledger[i], 256, L"%ls: through %ls.", name_of(i), ways);
+            else _snwprintf(ledger[i], 256, L"%ls: no edge leads there. Move it beside a PC, or double-tap Right "
+                                            L"Ctrl when it is the PC used last.", name_of(i));
+            ledger[i][255] = 0;
+            y = add_text(mx, y, mw, ledger[i], g.body, ways[0] ? C_INK2 : C_AMBER) + S(6);
+        }
+        y = add_text(mx, y + S(10), mw,
+                     L"Drag a PC to another cell, or select it and use the arrow keys. A PC crosses to the one "
+                     L"beside it and back the same way. The pointer arrives at the same height, crossing waits while "
+                     L"a mouse button is held, and what you copied comes along.",
                      g.small, C_INK3);
         break;
     case PAGE_KEYBOARD:
         add_label(L_KEYCAP, mx, y, S(190), S(40), L"Right Ctrl  \x00d7 2", g.mono, C_INK, NULL);
-        add_text(mx + S(210), y + S(10), mw - S(210), L"Switch input to the other PC and back.", g.body, C_INK2);
+        add_text(mx + S(210), y + S(10), mw - S(210),
+                 main_pc ? L"Switch input to the PC used last, and back." : L"Switch input between the PCs.",
+                 g.body, C_INK2);
         y += S(56);
         add_label(L_KEYCAP, mx, y, S(190), S(40), L"Ctrl + Alt + Pause", g.mono, C_INK, NULL);
-        add_text(mx + S(210), y + S(10), mw - S(210), L"Bring input back to this PC at once.", g.body, C_INK2);
+        add_text(mx + S(210), y + S(10), mw - S(210), L"Bring input back to the main PC at once.", g.body, C_INK2);
         y += S(56);
         y = add_text(mx, y, mw,
                      main_pc ? L"Both work on this PC's keyboard, wherever input is."
@@ -910,64 +1153,86 @@ static void layout(void)
         place(g.role[1], mx + S(178), y, S(170), S(40));
         y += S(40) + S(12);
         y = add_text(mx, y, mw,
-                     main_pc ? L"The main PC has the keyboard and mouse, and plays the other PC's sound."
+                     main_pc ? L"The main PC has the keyboard and mouse, and plays the other PCs' sound."
                              : L"The controlled PC is driven by the main PC's keyboard and mouse.",
                      g.small, C_INK3) + S(28);
         {
             int fw = min(mw, S(380));
             y = add_field_row(mx, y, fw, g.pw_label, g.pw,
                               g.cfg.has_key ? L"Set. Type a new one and press Enter to change it."
-                                            : L"Type the same password on both PCs and press Enter.");
+                                            : L"Type the same password on every PC and press Enter.");
             if (main_pc) {
-                y = add_field_row(mx, y, fw, g.peer_label, g.peer,
-                                  L"The controlled PC shows its address on its own Connection page.");
+                /* Two columns of addresses: the PCs added so far and one empty field for the next. */
+                int cw = min((mw - S(16)) / 2, S(300)), shown = 0, empty = 0;
+                for (int i = 0; i < MAX_PEERS; i++) {
+                    if (!g.peer[i].addr[0] && empty++) continue;
+                    int fx = mx + (shown % 2) * (cw + S(16)), fyy = y + (shown / 2) * S(84);
+                    place(g.addr_label[i], fx, fyy, cw, S(22));
+                    add_label(L_WELL, fx, fyy + S(26), cw, S(40), NULL, NULL, 0, g.addr[i]);
+                    place(g.addr[i], fx + S(12), fyy + S(26) + (S(40) - g.body_h) / 2, cw - S(24), g.body_h);
+                    shown++;
+                }
+                y += (shown + 1) / 2 * S(84);
+                y = add_text(mx, y, mw,
+                             L"Each controlled PC shows its address on its own Connection page. Clear an address "
+                             L"to remove that PC.",
+                             g.small, C_INK3) + S(16);
                 int listed = 0;
-                for (int i = 0; i < MAX_FOUND; i++)
-                    if (g.found[i].ip[0] && g.found[i].role == ROLE_CONTROLLED) {
+                for (int i = 0; i < MAX_FOUND; i++) {
+                    BOOL added = FALSE;
+                    wchar_t ip[16];
+                    MultiByteToWideChar(CP_ACP, 0, g.found[i].ip, -1, ip, 16);
+                    for (int k = 0; k < MAX_PEERS; k++) added |= g.found[i].ip[0] && !lstrcmpiW(ip, g.peer[k].addr);
+                    if (g.found[i].ip[0] && g.found[i].role == ROLE_CONTROLLED && !added) {
                         static wchar_t labels[MAX_FOUND][64];
-                        if (!listed++) y = add_text(mx, y - S(12), fw, L"Found on this network:", g.small, C_INK3) + S(4);
+                        if (!listed++) y = add_text(mx, y, fw, L"Found on this network, click to add:", g.small, C_INK3) + S(4);
                         _snwprintf(labels[i], 64, L"%ls  \x00b7  %hs", g.found[i].name, g.found[i].ip);
                         labels[i][63] = 0;
                         SetWindowTextW(g.found_btn[i], labels[i]);
                         place(g.found_btn[i], mx, y, fw, S(28));
                         y += S(30);
                     }
+                }
                 if (listed) y += S(16);
             }
         }
-        _snwprintf(address_line, 192, L"This PC's address: %ls  ·  port %d", g.addresses, g.port);
+        _snwprintf(address_line, 192, L"This PC's address: %ls  \x00b7  port %d", g.addresses, g.port);
         address_line[191] = 0;
         y = add_text(mx, y, mw, address_line, g.body, C_INK2);
         break;
     case PAGE_FILES:
         y = add_text(mx, y, mw,
-                     L"Copy files or folders in Explorer, cross to the other PC and press Ctrl+V. They travel when "
+                     L"Copy files or folders in Explorer, cross to another PC and press Ctrl+V. They travel when "
                      L"you cross and land in a dated folder under Nexus Received on its desktop, up to 1 GB at "
                      L"a time.",
                      g.body, C_INK2);
         if (g.files_note[0]) y = add_text(mx, y + S(16), mw, g.files_note, g.body, C_INK);
         break;
     case PAGE_SOUND: {
-        static wchar_t sound[320];
-        const wchar_t *name = g.peer_name[0] ? g.peer_name : L"the other PC";
-        if (g.status != NS_CONNECTED)
-            _snwprintf(sound, 320, main_pc ? L"Connect a controlled PC first; its sound then plays here."
+        static wchar_t sound[400];
+        int from = main_pc ? sound_from() : 0;
+        const wchar_t *name = name_of(from);
+        int state = from >= 0 ? g.peer[from].audio_state : AUDIO_UNKNOWN;
+        if (overall() != NS_CONNECTED || from < 0)
+            _snwprintf(sound, 400, main_pc ? L"Connect a controlled PC first; its sound then plays here."
                                            : L"Once the main PC connects, this PC's sound plays on its speakers.");
-        else if (g.audio_state == AUDIO_LOOPBACK || g.audio_state == AUDIO_STEREO_MIX)
-            _snwprintf(sound, 320,
+        else if (state == AUDIO_LOOPBACK || state == AUDIO_STEREO_MIX)
+            _snwprintf(sound, 400,
                        main_pc ? L"%ls's sound plays on this PC's speakers%ls. Its own speakers keep playing too; "
-                                 L"turn them down there if you only want to hear it here."
-                               : L"This PC's sound plays on %ls's speakers%ls.",
-                       name, g.audio_state == AUDIO_STEREO_MIX ? L", recorded from its sound card's Stereo Mix" : L"");
-        else if (g.audio_state == AUDIO_NONE)
-            _snwprintf(sound, 320,
+                                 L"turn them down there if you only want to hear it here.%ls"
+                               : L"This PC's sound plays on %ls's speakers%ls.%ls",
+                       name, state == AUDIO_STEREO_MIX ? L", recorded from its sound card's Stereo Mix" : L"",
+                       main_pc && peer_count() > 1 ? L" With several PCs, the sound comes from the one input "
+                                                     L"went to last." : L"");
+        else if (state == AUDIO_NONE)
+            _snwprintf(sound, 400,
                        L"%ls cannot record what its speakers play. On Windows XP, turn on the Stereo Mix (or What U "
                        L"Hear) recording device in the Sounds and Audio Devices control panel; Nexus looks again "
                        L"every few seconds.",
                        main_pc ? name : L"This PC");
         else
-            _snwprintf(sound, 320, L"Waiting for %ls to report its sound.", main_pc ? name : L"this PC");
-        sound[319] = 0;
+            _snwprintf(sound, 400, L"Waiting for %ls to report its sound.", main_pc ? name : L"this PC");
+        sound[399] = 0;
         y = add_text(mx, y, mw, sound, g.body, C_INK2);
         break;
     }
@@ -1007,11 +1272,19 @@ static void render(HDC dc, RECT c)
     SetRect(&r, S(52), S(30), S(SIDEBAR - 16), S(56));
     text(dc, g.line, r, g.status_font, p->ink, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     SetRect(&r, S(52), S(56), S(SIDEBAR - 16), S(80));
-    const wchar_t *who = g.status == NS_CONNECTED ? g.peer_name : g.cfg.role == ROLE_MAIN ? g.cfg.peer : L"";
-    text(dc, who[0] ? who : g.cfg.role == ROLE_MAIN ? L"Main PC" : L"Controlled PC", r, g.body, p->ink2,
-         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    BOOL main_pc = g.cfg.role == ROLE_MAIN;
+    int shown = shown_peer(), connected = 0;
+    for (int i = 0; main_pc && i < MAX_PEERS; i++) connected += g.peer[i].addr[0] && up(i);
+    for (int i = 0; main_pc && shown < 0 && i < MAX_PEERS; i++)
+        if (g.peer[i].addr[0]) shown = i;
+    wchar_t who[64];
+    if (connected > 1 && !g.remote) _snwprintf(who, 64, L"%d PCs connected", connected);
+    else if (shown >= 0 && (main_pc || overall() == NS_CONNECTED)) lstrcpynW(who, name_of(shown), 64);
+    else lstrcpynW(who, main_pc ? L"Main PC" : L"Controlled PC", 64);
+    who[63] = 0;
+    text(dc, who, r, g.body, p->ink2, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     wchar_t rtt[32] = L"Response: \x2014";
-    if (g.status == NS_CONNECTED && g.rtt >= 0) _snwprintf(rtt, 32, L"Response: %d ms", g.rtt);
+    if (shown >= 0 && up(shown) && g.peer[shown].rtt >= 0) _snwprintf(rtt, 32, L"Response: %d ms", g.peer[shown].rtt);
     SetRect(&r, S(28), S(92), S(SIDEBAR - 16), S(116));
     text(dc, rtt, r, g.body, p->ink2, DT_SINGLELINE | DT_VCENTER);
 
@@ -1040,6 +1313,16 @@ static void render(HDC dc, RECT c)
             round_rect(dc, &l->r, S(6), p->well, p->edge, S(1));
             text(dc, l->s, l->r, l->f, color(l->color), DT_SINGLELINE | DT_VCENTER | DT_CENTER);
             break;
+        case L_CELL: round_rect(dc, &l->r, S(6), NO_FILL, p->rule, S(1)); break;
+        case L_HOME: {
+            RECT t = l->r;
+            round_rect(dc, &l->r, S(6), p->well, p->signal, S(2));
+            t.top += S(8), t.bottom = t.top + S(22), t.left += S(12), t.right -= S(8);
+            text(dc, l->s, t, l->f, p->ink, DT_SINGLELINE | DT_VCENTER);
+            OffsetRect(&t, 0, S(22));
+            text(dc, g.my_name_w, t, g.small, p->ink3, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            break;
+        }
         }
     }
 
@@ -1086,7 +1369,7 @@ static void refresh(void)
     layout();
     redraw(NULL);
     for (int i = 0; i < NPAGES; i++) InvalidateRect(g.nav[i], NULL, FALSE);
-    for (int i = 0; i < 4; i++) InvalidateRect(g.edge[i], NULL, FALSE);
+    for (int i = 0; i < MAX_PEERS; i++) InvalidateRect(g.tile[i], NULL, FALSE);
     for (int i = 0; i < 2; i++) InvalidateRect(g.role[i], NULL, FALSE);
 }
 
@@ -1100,7 +1383,29 @@ static void set_page(int page)
 
 /* ---- applying settings ---- */
 
-static void sync_input(void) { input_main_set(g.status == NS_CONNECTED && g.cfg.role == ROLE_MAIN, g.cfg.edge); }
+static void sync_input(void)
+{
+    BOOL main_pc = g.cfg.role == ROLE_MAIN;
+    input_main_set(main_pc && first_connected() >= 0, main_pc ? exits(THIS_PC) : 0);
+}
+
+/* A controlled PC's address; empty removes it. A new one gets a free cell beside this PC. */
+static void set_address(int pc, const wchar_t *addr)
+{
+    Peer *p = &g.peer[pc];
+    if (lstrcmpiW(addr, p->addr) == 0) return;
+    BOOL added = !p->addr[0];
+    EnterCriticalSection(&g.cs);
+    lstrcpynW(p->addr, addr, 128);
+    LeaveCriticalSection(&g.cs);
+    if (added) free_cell(pc);
+    p->name[0] = 0;
+    SetWindowTextW(g.addr[pc], p->addr);
+    config_save();
+    net_restart(pc);
+    sync_input();
+    refresh();
+}
 
 static void apply_field(HWND edit)
 {
@@ -1118,21 +1423,33 @@ static void apply_field(HWND edit)
         SecureZeroMemory(utf8, sizeof utf8);
         SecureZeroMemory(v, sizeof v);
         SetWindowTextW(edit, L"");
-    } else {
+        config_save();
+        net_restart(-1);
+        refresh();
+        return;
+    }
+    for (int pc = 0; pc < MAX_PEERS; pc++) {
+        if (edit != g.addr[pc]) continue;
         /* Only what a host name or address can hold. */
         wchar_t *s = v, *e;
         while (*s == L' ') s++;
         for (e = s; *e && *e != L' '; e++)
             if (!iswalnum(*e) && *e != L'.' && *e != L'-') return;
         *e = 0;
-        if (lstrcmpW(s, g.cfg.peer) == 0) return;
-        EnterCriticalSection(&g.cs);
-        lstrcpynW(g.cfg.peer, s, 128);
-        LeaveCriticalSection(&g.cs);
-        SetWindowTextW(edit, g.cfg.peer);
+        set_address(pc, s);
     }
-    config_save();
-    net_restart();
+}
+
+/* Drags and arrow keys on the map end here; a PC already in that cell swaps places. */
+static void move_peer(int pc, int x, int y)
+{
+    int other = peer_at(x, y);
+    if (on_map(x, y) && other != THIS_PC && other != pc) {
+        if (other >= 0) g.peer[other].x = g.peer[pc].x, g.peer[other].y = g.peer[pc].y;
+        g.peer[pc].x = x, g.peer[pc].y = y;
+        config_save();
+        sync_input();
+    }
     refresh();
 }
 
@@ -1144,7 +1461,7 @@ static void set_role(int role)
     LeaveCriticalSection(&g.cs);
     input_release_all();
     config_save();
-    net_restart();
+    net_restart(-1);
     sync_input();
     refresh();
 }
@@ -1207,13 +1524,13 @@ static BOOL open_clipboard(void)
     return FALSE;
 }
 
-static void clipboard_send(void)
+static void clipboard_send(int pc)
 {
     if (GetClipboardSequenceNumber() == clip_seq || !open_clipboard()) return;
     HANDLE h = GetClipboardData(CF_UNICODETEXT), drop = GetClipboardData(CF_HDROP);
     const wchar_t *w = h && !drop ? GlobalLock(h) : NULL;
     /* Files copied in Explorer go instead of text; a transfer still running keeps the new copy back. */
-    if (drop && !files_send((HDROP)drop, g.peer_name))
+    if (drop && !files_send((HDROP)drop, name_of(pc), pc))
         lstrcpynW(g.files_note, L"Still sending the last files; copy the new ones again once they are across.", 256);
     if (w) {
         static unsigned char msg[LINK_MAX]; /* UI thread only */
@@ -1221,7 +1538,7 @@ static void clipboard_send(void)
         int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, (char *)msg + 1, LINK_MAX - 1, NULL, NULL);
         GlobalUnlock(h);
         msg[0] = MSG_CLIPBOARD;
-        if (n > 1) net_send(msg, n); /* n counts the NUL, which the type byte replaces */
+        if (n > 1) net_send(pc, msg, n); /* n counts the NUL, which the type byte replaces */
     }
     CloseClipboard();
     clip_seq = GetClipboardSequenceNumber();
@@ -1272,65 +1589,128 @@ static void clipboard_set(const unsigned char *s, int n)
 static void audio_out(const unsigned char *msg, int len)
 {
     if (msg[0] == MSG_AUDIO_STATE) PostMessageW(g.wnd, WM_AUDIO_STATE, msg[1], 0);
-    net_send(msg, len);
+    net_send(0, msg, len);
 }
 
 static BOOL is_main_pc(void) { return g.cfg.role == ROLE_MAIN; }
 
 /* Main PC, on connecting: a controlled PC with an older Nexus gets this PC's own installer. */
-static void update_peer(void)
+static void update_peer(int pc)
 {
     wchar_t path[MAX_PATH];
-    const wchar_t *name = g.peer_name[0] ? g.peer_name : L"The controlled PC";
-    g.update_note[0] = 0;
-    if (!g.peer_version[0])
+    const Peer *p = &g.peer[pc];
+    if (!p->version[0])
         _snwprintf(g.update_note, 256, L"%ls runs a Nexus too old to be updated from here. Install "
-                                       L"Nexus " WIDEN(NEXUS_VERSION) L" there by hand once.", name);
-    else if (version_cmp(g.peer_version, NEXUS_VERSION) < 0 && update_installer(NEXUS_VERSION, path) &&
-             update_push(NEXUS_VERSION, net_send))
-        _snwprintf(g.update_note, 256, L"Updating %ls to Nexus " WIDEN(NEXUS_VERSION) L"\x2026", name);
+                                       L"Nexus " WIDEN(NEXUS_VERSION) L" there by hand once.", name_of(pc));
+    else if (version_cmp(p->version, NEXUS_VERSION) < 0 && update_installer(NEXUS_VERSION, path) &&
+             update_push(NEXUS_VERSION, net_send, pc))
+        _snwprintf(g.update_note, 256, L"Updating %ls to Nexus " WIDEN(NEXUS_VERSION) L"\x2026", name_of(pc));
+    /* ponytail: one push at a time; a PC that finds it busy gets the update on its next connection */
     g.update_note[255] = 0;
 }
 
-/* The sidebar button: the controlled PC first if it is behind, then this PC (its installer restarts Nexus). */
+/* The sidebar button: a controlled PC that is behind first, then this PC (its installer restarts Nexus,
+ * and the other PCs get the new version when they reconnect). */
 static void install_update(void)
 {
     wchar_t path[MAX_PATH];
     if (!update_installer(g.update_version, path)) return;
     g.installing = TRUE;
-    if (g.status == NS_CONNECTED && g.peer_version[0] && version_cmp(g.peer_version, g.update_version) < 0 &&
-        update_push(g.update_version, net_send)) {
-        _snwprintf(g.update_note, 256, L"Sending Nexus %hs to %ls first\x2026", g.update_version, g.peer_name);
-        g.update_note[255] = 0;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        const Peer *p = &g.peer[i];
+        if (p->addr[0] && up(i) && p->version[0] && version_cmp(p->version, g.update_version) < 0 &&
+            update_push(g.update_version, net_send, i)) {
+            _snwprintf(g.update_note, 256, L"Sending Nexus %hs to %ls first\x2026", g.update_version, name_of(i));
+            g.update_note[255] = 0;
+            refresh();
+            return;
+        }
+    }
+    update_run(path);
+    refresh();
+}
+
+/* ---- crossing between the PCs on the map (main PC) ---- */
+
+/* The edge of this PC that faces pc, when it stands beside it; else -1. */
+static int edge_toward(int pc)
+{
+    for (int e = 0; e < 4; e++)
+        if (neighbour(THIS_PC, e) == pc) return e;
+    return -1;
+}
+
+/* Input goes to pc, moving in direction edge, at frac along the edge it comes in by (keep: the pointer
+ * stays where it is over there, for the shortcut). */
+static void enter_peer(int pc, int edge, BOOL keep, int frac)
+{
+    unsigned char m[6] = {MSG_ENTER, (BYTE)edge, (BYTE)keep, (BYTE)frac, (BYTE)(frac >> 8), (BYTE)exits(pc)};
+    clipboard_send(pc);
+    /* Before 0.3 a controlled PC knew one way back only, and takes no sixth byte. */
+    net_send(pc, m, version_cmp(g.peer[pc].version, "0.3.0") >= 0 ? 6 : 5);
+    g.target = g.last = pc;
+}
+
+/* The hook thread says input left this PC: through an edge, or by the shortcut (keep). */
+static void cross_from_here(int edge, BOOL keep, int frac)
+{
+    int to = keep ? (g.last >= 0 && up(g.last) ? g.last : first_connected()) : neighbour(THIS_PC, edge);
+    if (to < 0 || to == THIS_PC || !up(to)) { /* it went away meanwhile */
+        input_main_leave(-1, -1);
+        return;
+    }
+    if (keep) edge = edge_toward(to) >= 0 ? edge_toward(to) : EDGE_RIGHT;
+    enter_peer(to, edge, keep, frac);
+    refresh();
+}
+
+/* The PC with input let it go through an edge (edge -1: the way it came, from a Nexus before 0.3):
+ * on to the PC past that edge, or home. */
+static void cross_on(int from, int edge, int frac)
+{
+    if (edge < 0 && edge_toward(from) >= 0) edge = edge_toward(from) ^ 1;
+    int next = edge < 0 ? THIS_PC : neighbour(from, edge);
+    if (next >= 0 && next != THIS_PC && up(next)) {
+        clip_seq = 0; /* what was copied over there goes on, not only what was copied here */
+        enter_peer(next, edge, FALSE, frac < 0 ? 32767 : frac);
     } else {
-        update_run(path);
+        g.target = -1;
+        input_main_leave(next == THIS_PC ? edge ^ 1 : -1, frac);
+        if (g.test) g.remote = FALSE; /* no hook thread to report it */
     }
     refresh();
 }
 
-static void on_net_msg(unsigned char *msg, int len)
+static void go_home(void)
 {
+    unsigned char leave[4] = {MSG_LEAVE, 0, 0, 0};
+    net_send(g.target, leave, 4);
+    g.target = -1;
+}
+
+static void on_net_msg(int pc, unsigned char *msg, int len)
+{
+    Peer *p = &g.peer[pc];
     if (msg[0] == MSG_CLIPBOARD && len > 1) {
         clipboard_set(msg + 1, len - 1);
     } else if (msg[0] == MSG_PONG && len == 5) {
         DWORD sent = msg[1] | msg[2] << 8 | msg[3] << 16 | (DWORD)msg[4] << 24;
-        g.rtt = (int)(GetTickCount() - sent);
+        p->rtt = (int)(GetTickCount() - sent);
         RECT r = {0, 0, S(SIDEBAR), S(STATUS_H)};
         redraw(&r);
     } else if (g.cfg.role == ROLE_MAIN) {
-        if (msg[0] == MSG_LEAVE && len == 4) {
-            input_main_leave(msg[1] ? msg[2] | msg[3] << 8 : -1);
-            if (g.test) g.remote = FALSE, refresh(); /* no hook thread to report it */
-        }
-        else if (msg[0] == MSG_AUDIO) audio_play(msg, len);
-        else if (msg[0] == MSG_AUDIO_STATE && len == 2 && msg[1] <= AUDIO_NONE && msg[1] != g.audio_state)
-            g.audio_state = msg[1], refresh();
+        if (msg[0] == MSG_LEAVE && (len == 4 || len == 5) && pc == g.target)
+            cross_on(pc, len == 5 && msg[4] <= EDGE_BOTTOM ? msg[4] : -1, msg[1] ? msg[2] | msg[3] << 8 : -1);
+        else if (msg[0] == MSG_AUDIO && pc == sound_from())
+            audio_play(msg, len);
+        else if (msg[0] == MSG_AUDIO_STATE && len == 2 && msg[1] <= AUDIO_NONE && msg[1] != p->audio_state)
+            p->audio_state = msg[1], refresh();
     } else {
         unsigned char out[8];
         BOOL was = input_controlled_active();
         int n = input_replay(msg, len, out);
-        if (was && !input_controlled_active()) clipboard_send(); /* ahead of LEAVE, so it is there on arrival */
-        if (n) net_send(out, n);
+        if (was && !input_controlled_active()) clipboard_send(0); /* ahead of LEAVE, so it is there on arrival */
+        if (n) net_send(0, out, n);
         if (was != input_controlled_active()) refresh();
     }
 }
@@ -1344,13 +1724,14 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         g.setup = add_button(L"Set up the connection", ID_SETUP, K_OUTLINE);
         g.role[0] = add_button(L"Main PC", ID_ROLE0, K_SEGMENT);
         g.role[1] = add_button(L"Controlled PC", ID_ROLE1, K_SEGMENT);
-        for (int i = 0; i < 4; i++) {
-            static const wchar_t *names[] = {L"Left", L"Right", L"Top", L"Bottom"};
-            g.edge[i] = add_button(names[i], ID_EDGE0 + i, K_SEGMENT);
-        }
         g.pw = add_field(L"Shared password", ID_PASSWORD_LABEL, ID_PASSWORD, ES_PASSWORD, &g.pw_label);
-        g.peer = add_field(L"Controlled PC's address", ID_PEER_LABEL, ID_PEER, 0, &g.peer_label);
-        SetWindowTextW(g.peer, g.cfg.peer);
+        for (int i = 0; i < MAX_PEERS; i++) {
+            static const wchar_t *labels[] = {L"Controlled PC 1", L"Controlled PC 2", L"Controlled PC 3",
+                                              L"Controlled PC 4"};
+            g.addr[i] = add_field(labels[i], ID_ADDR_LABEL0 + i, ID_ADDR0 + i, 0, &g.addr_label[i]);
+            SetWindowTextW(g.addr[i], g.peer[i].addr);
+            g.tile[i] = add_button(L"", ID_TILE0 + i, K_TILE);
+        }
         g.site = add_button(L"Nexus on GitHub", ID_SITE, K_LINK);
         for (int i = 0; i < MAX_FOUND; i++) g.found_btn[i] = add_button(L"", ID_FOUND0 + i, K_LINK);
         g.update = add_button(L"", ID_UPDATE, K_LINK);
@@ -1388,12 +1769,8 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         if (id >= ID_NAV0 && id < ID_NAV0 + NPAGES) set_page(id - ID_NAV0);
         else if (id == ID_SETUP) set_page(PAGE_CONNECTION);
         else if (id == ID_ROLE0 || id == ID_ROLE1) set_role(id - ID_ROLE0);
-        else if (id >= ID_EDGE0 && id <= ID_EDGE3) {
-            g.cfg.edge = id - ID_EDGE0;
-            config_save();
-            sync_input();
-            refresh();
-        } else if ((id == ID_PASSWORD || id == ID_PEER) && (code == EN_SETFOCUS || code == EN_KILLFOCUS)) {
+        else if ((id == ID_PASSWORD || (id >= ID_ADDR0 && id <= ID_ADDR3)) &&
+                 (code == EN_SETFOCUS || code == EN_KILLFOCUS)) {
             if (code == EN_KILLFOCUS) apply_field((HWND)lp);
             redraw(&g.module_rc);
         } else if (id == ID_QUIT || id == ID_TRAY_QUIT) quit();
@@ -1401,13 +1778,13 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         else if (id == ID_SITE) ShellExecuteW(NULL, L"open", SITE_URL, NULL, NULL, SW_SHOWNORMAL);
         else if (id == ID_UPDATE) install_update();
         else if (id >= ID_FOUND0 && id <= ID_FOUND3 && g.found[id - ID_FOUND0].ip[0]) {
-            EnterCriticalSection(&g.cs);
-            MultiByteToWideChar(CP_ACP, 0, g.found[id - ID_FOUND0].ip, -1, g.cfg.peer, 128);
-            LeaveCriticalSection(&g.cs);
-            SetWindowTextW(g.peer, g.cfg.peer);
-            config_save();
-            net_restart();
-            refresh();
+            wchar_t ip[16];
+            MultiByteToWideChar(CP_ACP, 0, g.found[id - ID_FOUND0].ip, -1, ip, 16);
+            for (int i = 0; i < MAX_PEERS; i++)
+                if (!g.peer[i].addr[0]) { /* the first free slot; with all four taken nothing happens */
+                    set_address(i, ip);
+                    break;
+                }
         }
         return 0;
     }
@@ -1418,47 +1795,61 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (discovery_expire() && g.page == PAGE_CONNECTION) refresh();
         if (g.cfg.role == ROLE_MAIN && GetTickCount() / 1000 % 3 == 0) discovery_probe();
-        if (g.status == NS_CONNECTED) {
+        for (int i = 0; i < MAX_PEERS; i++) {
             DWORD t = GetTickCount();
             unsigned char ping[5] = {MSG_PING, (BYTE)t, (BYTE)(t >> 8), (BYTE)(t >> 16), (BYTE)(t >> 24)};
-            net_send(ping, 5);
+            if (g.peer[i].status == NS_CONNECTED) net_send(i, ping, 5);
         }
         return 0;
-    case WM_NET_STATUS:
-        if ((int)wp != g.status) {
-            if (wp != NS_CONNECTED) {
-                g.rtt = -1, g.remote = FALSE, g.audio_state = AUDIO_UNKNOWN;
+    case WM_NET_STATUS: {
+        Peer *p = &g.peer[lp];
+        if ((int)wp == p->status) return 0;
+        if (wp != NS_CONNECTED) {
+            BOOL sound = (int)lp == sound_from();
+            p->rtt = -1, p->audio_state = AUDIO_UNKNOWN;
+            if (g.cfg.role == ROLE_CONTROLLED) {
                 input_release_all();
                 audio_capture_stop();
-                audio_play_stop();
-            } else if (g.cfg.role == ROLE_CONTROLLED) {
-                audio_capture_start(audio_out);
-            } else {
-                update_peer();
+            } else if ((int)lp == g.target) { /* input was over there: it comes home */
+                g.target = -1;
+                input_main_leave(-1, -1);
+                if (g.test) g.remote = FALSE;
             }
-            g.status = (int)wp;
-            sync_input();
-            refresh();
+            if (sound) audio_play_stop();
+        } else if (g.cfg.role == ROLE_CONTROLLED) {
+            audio_capture_start(audio_out);
+        } else {
+            update_peer((int)lp);
         }
-        return 0;
-    case WM_NET_MSG:
-        on_net_msg((unsigned char *)lp, (int)wp);
-        free((void *)lp);
-        return 0;
-    case WM_INPUT_SEND: {
-        unsigned char msg[8];
-        int n = input_pack((UINT)wp, lp, msg);
-        if (wp == MSG_ENTER) clipboard_send();
-        if (n) net_send(msg, n);
+        p->status = (int)wp;
+        sync_input();
+        refresh();
         return 0;
     }
+    case WM_NET_MSG: {
+        unsigned char *copy = (unsigned char *)lp;
+        on_net_msg(copy[0], copy + 1, (int)wp);
+        free(copy);
+        return 0;
+    }
+    case WM_INPUT_SEND:
+        if (wp == MSG_ENTER) {
+            cross_from_here((int)(lp & 0xF), (int)(lp >> 4) & 1, (int)(lp >> 8) & 0xFFFF);
+        } else if (wp == MSG_LEAVE) {
+            go_home();
+        } else {
+            unsigned char msg[8];
+            int n = input_pack((UINT)wp, lp, msg);
+            if (n) net_send(g.target, msg, n);
+        }
+        return 0;
     case WM_UPDATE_READY:
         lstrcpynA(g.update_version, (const char *)lp, 16);
         free((void *)lp);
         refresh();
         return 0;
     case WM_UPDATE_PUSHED: {
-        const wchar_t *name = g.peer_name[0] ? g.peer_name : L"The controlled PC";
+        const wchar_t *name = name_of((int)lp);
         if (wp) _snwprintf(g.update_note, 256, L"%ls got the update and installs it now. On Windows Vista or later, "
                                                L"confirm the Windows prompt on its own screen.", name);
         else _snwprintf(g.update_note, 256, L"Sending the update to %ls did not finish; it is tried again on the "
@@ -1489,7 +1880,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         test_command((const char *)wp, (char *)lp);
         return 0;
     case WM_AUDIO_STATE:
-        g.audio_state = (int)wp;
+        g.peer[0].audio_state = (int)wp;
         refresh();
         return 0;
     case WM_INPUT_STATE:
@@ -1567,27 +1958,38 @@ static void test_command(const char *cmd, char *out)
         MultiByteToWideChar(CP_UTF8, 0, arg, -1, warg, 1024);
     }
     lstrcpynA(out, "ok", cap);
-    if (!strncmp(cmd, "status", 6)) {
+    if (!strncmp(cmd, "status", 6)) { /* about the PC with input, else the one used last or the first one */
         char peer[64], note[512];
-        WideCharToMultiByte(CP_UTF8, 0, g.peer_name, -1, peer, sizeof peer, NULL, NULL);
+        int pc = shown_peer() >= 0 ? shown_peer() : 0;
+        WideCharToMultiByte(CP_UTF8, 0, g.peer[pc].name, -1, peer, sizeof peer, NULL, NULL);
         WideCharToMultiByte(CP_UTF8, 0, g.files_note, -1, note, sizeof note, NULL, NULL);
         _snprintf(out, cap, "role=%s status=%d peer=%s peer_version=%s remote=%d active=%d audio=%d version=%s files=%s",
-                  g.cfg.role == ROLE_MAIN ? "main" : "controlled", g.status, peer, g.peer_version, g.remote,
-                  input_controlled_active(), g.audio_state, NEXUS_VERSION, note);
-    } else if (!strncmp(cmd, "cross", 5) && g.cfg.role == ROLE_MAIN && g.status == NS_CONNECTED) {
-        unsigned char enter[5] = {MSG_ENTER, (BYTE)g.cfg.edge, 1 /* pointer stays where it is */, 0, 0};
-        clipboard_send(); /* what a real crossing sends first */
-        net_send(enter, 5);
+                  g.cfg.role == ROLE_MAIN ? "main" : "controlled", overall(), peer, g.peer[pc].version, g.remote,
+                  input_controlled_active(), g.peer[pc].audio_state, NEXUS_VERSION, note);
+    } else if (!strncmp(cmd, "peers", 5)) { /* pc x,y status name, one per line */
+        int at = 0;
+        out[0] = 0;
+        for (int i = 0; i < MAX_PEERS; i++) {
+            char name[64];
+            WideCharToMultiByte(CP_UTF8, 0, name_of(i), -1, name, sizeof name, NULL, NULL);
+            if (g.peer[i].addr[0])
+                at += _snprintf(out + at, cap - at, "%d %d,%d %d %s%s\n", i, g.peer[i].x, g.peer[i].y, g.peer[i].status,
+                                name, i == g.target ? " *" : "");
+        }
+    } else if (!strncmp(cmd, "cross", 5) && g.cfg.role == ROLE_MAIN) { /* "cross [pc]": as the shortcut does */
+        int pc = sp ? atoi(arg) : first_connected();
+        if (pc < 0 || pc >= MAX_PEERS || !up(pc)) return (void)lstrcpynA(out, "not connected", cap);
+        if (g.target >= 0) go_home();
+        enter_peer(pc, edge_toward(pc) >= 0 ? edge_toward(pc) : EDGE_RIGHT, TRUE, 0);
         g.remote = TRUE, refresh();
     } else if (!strncmp(cmd, "home", 4) && g.cfg.role == ROLE_MAIN) {
-        unsigned char leave[4] = {MSG_LEAVE, 0, 0, 0};
-        net_send(leave, 4);
+        go_home();
         g.remote = FALSE, refresh();
     } else if (!strncmp(cmd, "move ", 5)) {
         char *end;
         int dx = (int)strtol(arg, &end, 10), dy = (int)strtol(end, NULL, 10);
         unsigned char m[5] = {MSG_MOVE, (BYTE)dx, (BYTE)(dx >> 8), (BYTE)dy, (BYTE)(dy >> 8)};
-        net_send(m, 5);
+        net_send(g.target, m, 5);
     } else if (!strncmp(cmd, "cursor", 6)) {
         POINT p;
         GetCursorPos(&p);
@@ -1675,6 +2077,8 @@ static DWORD WINAPI test_thread(void *unused)
         EnterCriticalSection(&g.cs);
         memcpy(key, g.cfg.key, 32);
         LeaveCriticalSection(&g.cs);
+        DWORD timeout = 30000; /* a driver that vanished must not keep the next one out */
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof timeout);
         int n;
         if (link_handshake(&l, s, 0, key, g.my_name, NEXUS_VERSION, peer, peer_version) == LINK_OK)
             while ((n = link_recv(&l, in, LINK_MAX)) > 0)
@@ -1718,13 +2122,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     InitializeCriticalSection(&g.cs);
-    g.wake = CreateEventW(NULL, FALSE, FALSE, NULL);
-    g.conn = g.listener = INVALID_SOCKET;
-    g.rtt = -1;
+    g.listener = INVALID_SOCKET;
+    g.target = g.last = g.drag = -1;
+    for (int i = 0; i < MAX_PEERS; i++) {
+        g.peer[i].wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+        g.peer[i].conn = INVALID_SOCKET;
+        g.peer[i].rtt = -1;
+        InitializeCriticalSection(&g.peer[i].send_cs);
+    }
     wchar_t name[MAX_COMPUTERNAME_LENGTH + 1];
     DWORD name_len = MAX_COMPUTERNAME_LENGTH + 1;
     GetComputerNameW(name, &name_len);
     WideCharToMultiByte(CP_UTF8, 0, name, -1, g.my_name, sizeof g.my_name, NULL, NULL);
+    lstrcpynW(g.my_name_w, name, 64);
     config_load();
     this_pc_addresses();
 
@@ -1748,7 +2158,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     if (g.test) CloseHandle(CreateThread(NULL, 0, test_thread, NULL, 0, NULL));
     else update_start(g.wnd, is_main_pc);
     sync_input();
-    CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));
+    for (int i = 0; i < MAX_PEERS; i++) CloseHandle(CreateThread(NULL, 0, net_thread, (void *)(INT_PTR)i, 0, NULL));
     g.discovery_port = g.test ? TEST_DISCOVERY_PORT : DISCOVERY_PORT;
     discovery_start();
     /* Started at sign-in with /tray: stay in the tray until asked. */
@@ -1764,8 +2174,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
             if (next >= 0 && next < NPAGES) set_page(next), SetFocus(g.nav[next]);
             continue;
         }
-        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && (msg.hwnd == g.pw || msg.hwnd == g.peer)) {
+        int tile = -1, field = msg.hwnd == g.pw;
+        for (int i = 0; i < MAX_PEERS; i++) {
+            if (msg.hwnd == g.tile[i]) tile = i;
+            field |= msg.hwnd == g.addr[i];
+        }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && field) {
             apply_field(msg.hwnd);
+            continue;
+        }
+        if (tile >= 0 && msg.message == WM_KEYDOWN && msg.wParam >= VK_LEFT && msg.wParam <= VK_DOWN) {
+            static const int dx[] = {-1, 0, 1, 0}, dy[] = {0, -1, 0, 1}; /* VK_LEFT, UP, RIGHT, DOWN */
+            int k = (int)msg.wParam - VK_LEFT;
+            move_peer(tile, g.peer[tile].x + dx[k], g.peer[tile].y + dy[k]);
+            SetFocus(g.tile[tile]);
             continue;
         }
         if (IsDialogMessageW(g.wnd, &msg)) continue;

@@ -12,13 +12,13 @@ enum { EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, EDGE_BOTTOM };
 
 /* Main PC: hooks run on their own thread so a busy UI never stalls the system's input. */
 void input_main_start(HWND ui);
-void input_main_set(BOOL connected, int edge); /* call on connect, disconnect and edge change */
-void input_main_leave(int frac);               /* the controlled PC handed input back; -1: no position */
+void input_main_set(BOOL connected, int edges); /* edges: bit per edge of this screen leading to a connected PC */
+void input_main_leave(int edge, int frac);      /* input comes back at frac along edge; -1: where it left */
 int input_pack(UINT type, LPARAM packed, unsigned char *out); /* WM_INPUT_SEND -> wire message */
 void input_debug(char *out, int cap); /* test mode: what the hooks have seen */
 
-/* Controlled PC: replays a wire message; returns a LEAVE message to send back in out, or 0. */
-int input_replay(const unsigned char *msg, int len, unsigned char out[8]);
+/* Controlled PC: replays a wire message; returns the length of a LEAVE to send back in leave, or 0. */
+int input_replay(const unsigned char *msg, int len, unsigned char leave[8]);
 void input_release_all(void);
 BOOL input_controlled_active(void);
 

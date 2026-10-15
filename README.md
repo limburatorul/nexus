@@ -4,9 +4,10 @@
 
 Împingi cursorul peste marginea ecranului și el continuă pe celălalt PC. Tastatura merge după el,
 clipboard-ul și fișierele copiate te urmează, iar sunetul PC-ului controlat se aude pe boxele
-PC-ului principal.
+PC-ului principal. Până la patru PC-uri controlate se aranjează prin tragere pe o hartă în jurul
+PC-ului principal, iar cursorul trece din unul în altul ca între monitoarele aceluiași PC.
 
-> **Stare:** în lucru, versiunea 0.2: mouse, tastatură, clipboard, sunet, fișiere, update automat și descoperire în rețea, pe Windows (XP–11) și Linux (Wayland). Testată automat între Windows 11, XP și Kubuntu; planul și stadiul sunt în [SPEC.md](SPEC.md).
+> **Stare:** în lucru, versiunea 0.3: mouse, tastatură, clipboard, sunet, fișiere, update automat, descoperire în rețea și mai multe PC-uri pe o hartă, pe Windows (XP–11) și Linux (Wayland; acolo PC-ul principal lucrează deocamdată cu un singur PC controlat). Testată automat între Windows 11, XP, Kubuntu și Manjaro; planul și stadiul sunt în [SPEC.md](SPEC.md).
 
 ## Sisteme suportate
 

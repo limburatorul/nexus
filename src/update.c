@@ -180,7 +180,8 @@ void update_run(const wchar_t *installer) { ShellExecuteW(NULL, L"open", install
 
 static struct {
     char version[16];
-    BOOL (*send)(const unsigned char *, int);
+    BOOL (*send)(int, const unsigned char *, int);
+    int to;
 } push;
 static volatile LONG pushing;
 
@@ -199,26 +200,27 @@ static DWORD WINAPI push_thread(void *unused)
         m[0] = MSG_UPDATE_BEGIN;
         for (int i = 0; i < 4; i++) m[1 + i] = (unsigned char)(size >> (8 * i));
         memcpy(m + 5, push.version, v);
-        ok = push.send(m, 5 + v);
+        ok = push.send(push.to, m, 5 + v);
         DWORD got;
         while (ok && ReadFile(f, m + 1, CHUNK, &got, NULL) && got) {
             m[0] = MSG_UPDATE_DATA;
-            ok = push.send(m, 1 + (int)got);
+            ok = push.send(push.to, m, 1 + (int)got);
         }
         m[0] = MSG_UPDATE_END;
-        ok = ok && push.send(m, 1);
+        ok = ok && push.send(push.to, m, 1);
     }
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
-    PostMessageW(ui, WM_UPDATE_PUSHED, ok, 0);
+    PostMessageW(ui, WM_UPDATE_PUSHED, ok, push.to);
     InterlockedExchange(&pushing, 0);
     return 0;
 }
 
-BOOL update_push(const char *version, BOOL (*send)(const unsigned char *, int))
+BOOL update_push(const char *version, BOOL (*send)(int, const unsigned char *, int), int to)
 {
     if (InterlockedCompareExchange(&pushing, 1, 0)) return FALSE;
     lstrcpynA(push.version, version, 16);
     push.send = send;
+    push.to = to;
     HANDLE t = CreateThread(NULL, 0, push_thread, NULL, 0, NULL);
     if (!t) InterlockedExchange(&pushing, 0);
     else CloseHandle(t);

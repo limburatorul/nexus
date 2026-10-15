@@ -23,17 +23,23 @@ boxele principalului.
 ## Cum funcționează
 **Principal (server):** cârlige `WH_MOUSE_LL` + `WH_KEYBOARD_LL` (există de la Win2000).
 - Cârligele rulează pe un fir propriu, ca un UI ocupat să nu blocheze inputul sistemului.
-- Cursorul atinge marginea configurată (și niciun buton nu e apăsat) → modul „remote”: evenimentele locale
+- Cursorul atinge o margine care duce la un PC conectat (și niciun buton nu e apăsat) → modul „remote”: evenimentele locale
   sunt înghițite, cursorul e parcat în centrul ecranului sub o fereastră invizibilă fără cursor (deci dispare),
   iar deplasările (dx, dy) și tastele (virtual key + scancode + flaguri) pleacă pe rețea.
 - Tastele ținute apăsate în momentul trecerii se eliberează local, nu pe celălalt PC.
-- Revenirea: marginea opusă de pe PC-ul controlat (acesta raportează când cursorul lui o atinge),
+- Revenirea: o margine de pe PC-ul controlat care duce înapoi (acesta raportează când cursorul o depășește),
   dublu-tap pe **Right Ctrl** sau, ca scăpare de urgență, **Ctrl+Alt+Pause**.
+- **Mai multe PC-uri (0.3):** principalul se conectează la până la 4 PC-uri controlate, fiecare cu o celulă pe o
+  hartă 5 × 3 în jurul lui (pagina Crossing, cheile `peer`…`peer4` și `place`…`place4` = `x,y` în `nexus.ini`).
+  Inputul trece la PC-ul de dincolo de marginea atinsă; de pe un PC controlat merge mai departe la vecinul lui
+  (lanț), principalul fiind cel care rutează. Dublu-tap pe Right Ctrl duce la PC-ul folosit ultima dată.
+  Sunetul vine de la PC-ul folosit ultima dată.
 - Dacă legătura cade cât timp suntem în modul remote, controlul revine imediat local.
 
 **Controlat (client):** `SendInput` absolut pentru mouse (poziția e urmărită local, accelerația se aplică o
 singură dată, pe principal) și pe virtual key pentru taste. Când cursorul e la marginea de întoarcere și
-mișcarea împinge mai departe, trimite LEAVE cu poziția de-a lungul marginii. La LEAVE sau la deconectare,
+mișcarea împinge mai departe printr-o margine din masca primită în ENTER, trimite LEAVE cu poziția de-a lungul
+marginii și marginea. La LEAVE sau la deconectare,
 eliberează toate tastele și butoanele ținute. Pe un ecran scalat la 150%, Windows poziționează inputul absolut
 pe o grilă de 1,5 px, deci precizia e ±1 px.
 
@@ -47,7 +53,9 @@ pe o grilă de 1,5 px, deci precizia e ±1 px.
   deci un cadru reluat sau reordonat nu se deschide.
 - Primul cadru în fiecare sens e `HELLO` cu numele PC-ului. Dacă nu se deschide, parolele diferă.
 - Mesaje: `HELLO 1`, `PING 2`/`PONG 3` (u32 ms, la fiecare secundă; 6 s de liniște = legătură căzută),
-  `ENTER 4` [margine, păstrează-poziția, poziție u16], `LEAVE 5` [are-poziție, poziție u16],
+  `ENTER 4` [direcție, păstrează-poziția, poziție u16, ieșiri], `LEAVE 5` [are-poziție, poziție u16, margine],
+  (ieșiri = bit pe margine care duce la alt PC; un principal 0.2 trimite ENTER fără el, iar controlatul îi
+  răspunde atunci cu LEAVE fără margine, deci versiunile vechi se înțeleg cu cele noi),
   `MOVE 6` [dx i16, dy i16], `BUTTON 7` [buton 1–5, apăsat], `WHEEL 8` [delta i16, orizontal], `KEY 9` [vk, scan, flaguri],
   `CLIPBOARD 10` [text UTF-8], `AUDIO 11`, `AUDIO_STATE 12`, `FILE_BEGIN 13`–`FILE_END 16`.
 

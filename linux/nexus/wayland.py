@@ -50,7 +50,8 @@ class Injector:
     def __init__(self):
         self.remote = inject_portal.remote()
         self.active = False
-        self.ret_edge = LEFT
+        self.exits = 1 << LEFT  # edges of this screen that lead to another PC
+        self.tell_edge = False  # the main PC names the edge each LEAVE went through (0.3 and later)
 
     def start(self) -> None:
         self.remote.start()
@@ -61,10 +62,13 @@ class Injector:
     def replay(self, msg: bytes):
         """Plays one message; returns a LEAVE to send back when the pointer goes home, else None."""
         kind = msg[0]
-        if kind == link.ENTER and len(msg) == 5 and msg[1] <= BOTTOM:
-            self.ret_edge = msg[1] ^ 1  # the main PC's right edge leads in at this PC's left
+        if kind == link.ENTER and len(msg) in (5, 6) and msg[1] <= BOTTOM:
+            way_in = msg[1] ^ 1  # moving right, the pointer comes in at this PC's left
+            # A main PC before 0.3 knows one PC only: the way in is the way back.
+            self.exits = msg[5] & 15 if len(msg) == 6 else 1 << way_in
+            self.tell_edge = len(msg) == 6
             if not msg[2]:
-                x, y = on_edge(bounds(), self.ret_edge, msg[3] | msg[4] << 8)
+                x, y = on_edge(bounds(), way_in, msg[3] | msg[4] << 8)
                 self.remote.submit(lambda s: s.place(x, y))
             self.active = True
         elif kind == link.LEAVE and len(msg) == 4:
@@ -76,13 +80,13 @@ class Injector:
             dx, dy = struct.unpack("<hh", msg[1:])
             b = bounds()
             x, y = desktop_portal.cursor_position()
-            e = self.ret_edge
-            if ((e == LEFT and x <= b[0] and dx < 0) or (e == RIGHT and x >= b[2] and dx > 0)
-                    or (e == TOP and y <= b[1] and dy < 0) or (e == BOTTOM and y >= b[3] and dy > 0)):
-                frac = along(b, x, y, e)
-                self.release_all()
-                self.active = False
-                return bytes([link.LEAVE, 1]) + struct.pack("<H", frac)
+            out = (x <= b[0] and dx < 0, x >= b[2] and dx > 0, y <= b[1] and dy < 0, y >= b[3] and dy > 0)
+            for e in range(4):
+                if out[e] and self.exits & 1 << e:  # through an edge to another PC: input goes there
+                    frac = along(b, x, y, e)
+                    self.release_all()
+                    self.active = False
+                    return bytes([link.LEAVE, 1]) + struct.pack("<H", frac) + (bytes([e]) if self.tell_edge else b"")
             self.remote.submit(lambda s: s.move_by(dx, dy))
         elif kind == link.BUTTON and len(msg) == 3 and msg[1] in BUTTONS:
             code, down = BUTTONS[msg[1]], bool(msg[2])
