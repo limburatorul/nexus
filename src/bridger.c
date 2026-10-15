@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
+#include "audio.h"
 #include "input.h"
 #include "resource.h"
 #include "version.h"
@@ -22,6 +23,7 @@
 #define WM_BRIDGER_SHOW (WM_APP + 3) /* sent by a second instance */
 #define WM_NET_STATUS (WM_APP + 4)   /* wParam: NS_* */
 #define WM_NET_MSG (WM_APP + 5)      /* wParam: length, lParam: malloc'd message, freed here */
+#define WM_AUDIO_STATE (WM_APP + 6)  /* wParam: AUDIO_* of this controlled PC */
 #define TIMER_PING 1
 
 enum { ID_TRAY_OPEN = 1, ID_TRAY_QUIT, ID_NAV0 = 100, ID_QUIT = 200, ID_SITE, ID_SETUP, ID_ROLE0, ID_ROLE1,
@@ -110,6 +112,7 @@ static struct {
     /* UI view of the link */
     int status, rtt;
     BOOL remote; /* main: input is on the controlled PC */
+    int audio_state; /* AUDIO_*: how the controlled PC captures its sound */
 } g;
 
 static int S(int px) { return MulDiv(px, g.dpi, 96); }
@@ -776,6 +779,30 @@ static void layout(void)
         address_line[191] = 0;
         y = add_text(mx, y, mw, address_line, g.body, C_INK2);
         break;
+    case PAGE_SOUND: {
+        static wchar_t sound[320];
+        const wchar_t *name = g.peer_name[0] ? g.peer_name : L"the other PC";
+        if (g.status != NS_CONNECTED)
+            _snwprintf(sound, 320, main_pc ? L"Connect a controlled PC first; its sound then plays here."
+                                           : L"Once the main PC connects, this PC's sound plays on its speakers.");
+        else if (g.audio_state == AUDIO_LOOPBACK || g.audio_state == AUDIO_STEREO_MIX)
+            _snwprintf(sound, 320,
+                       main_pc ? L"%ls's sound plays on this PC's speakers%ls. Its own speakers keep playing too; "
+                                 L"turn them down there if you only want to hear it here."
+                               : L"This PC's sound plays on %ls's speakers%ls.",
+                       name, g.audio_state == AUDIO_STEREO_MIX ? L", recorded from its sound card's Stereo Mix" : L"");
+        else if (g.audio_state == AUDIO_NONE)
+            _snwprintf(sound, 320,
+                       L"%ls cannot record what its speakers play. On Windows XP, turn on the Stereo Mix (or What U "
+                       L"Hear) recording device in the Sounds and Audio Devices control panel; Bridger looks again "
+                       L"every few seconds.",
+                       main_pc ? name : L"This PC");
+        else
+            _snwprintf(sound, 320, L"Waiting for %ls to report its sound.", main_pc ? name : L"this PC");
+        sound[319] = 0;
+        y = add_text(mx, y, mw, sound, g.body, C_INK2);
+        break;
+    }
     default:
         y = add_text(mx, y, mw, L"Coming in a later version.", g.body, C_INK2);
     }
@@ -1008,6 +1035,13 @@ static void clipboard_set(const unsigned char *s, int n)
     clip_seq = GetClipboardSequenceNumber();
 }
 
+/* The capture thread's messages go out as they are; its state also shows on this PC's Sound page. */
+static void audio_out(const unsigned char *msg, int len)
+{
+    if (msg[0] == MSG_AUDIO_STATE) PostMessageW(g.wnd, WM_AUDIO_STATE, msg[1], 0);
+    net_send(msg, len);
+}
+
 static void on_net_msg(unsigned char *msg, int len)
 {
     if (msg[0] == MSG_CLIPBOARD && len > 1) {
@@ -1019,6 +1053,9 @@ static void on_net_msg(unsigned char *msg, int len)
         InvalidateRect(g.wnd, &r, FALSE);
     } else if (g.cfg.role == ROLE_MAIN) {
         if (msg[0] == MSG_LEAVE && len == 4) input_main_leave(msg[1] ? msg[2] | msg[3] << 8 : -1);
+        else if (msg[0] == MSG_AUDIO) audio_play(msg, len);
+        else if (msg[0] == MSG_AUDIO_STATE && len == 2 && msg[1] <= AUDIO_NONE && msg[1] != g.audio_state)
+            g.audio_state = msg[1], refresh();
     } else {
         unsigned char out[8];
         BOOL was = input_controlled_active();
@@ -1101,7 +1138,14 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_NET_STATUS:
         if ((int)wp != g.status) {
-            if (wp != NS_CONNECTED) g.rtt = -1, g.remote = FALSE, input_release_all();
+            if (wp != NS_CONNECTED) {
+                g.rtt = -1, g.remote = FALSE, g.audio_state = AUDIO_UNKNOWN;
+                input_release_all();
+                audio_capture_stop();
+                audio_play_stop();
+            } else if (g.cfg.role == ROLE_CONTROLLED) {
+                audio_capture_start(audio_out);
+            }
             g.status = (int)wp;
             sync_input();
             refresh();
@@ -1118,6 +1162,10 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         if (n) net_send(msg, n);
         return 0;
     }
+    case WM_AUDIO_STATE:
+        g.audio_state = (int)wp;
+        refresh();
+        return 0;
     case WM_INPUT_STATE:
         g.remote = (BOOL)wp;
         refresh();

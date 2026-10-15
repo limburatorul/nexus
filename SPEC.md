@@ -49,15 +49,19 @@ pe o grilă de 1,5 px, deci precizia e ±1 px.
 - Mesaje: `HELLO 1`, `PING 2`/`PONG 3` (u32 ms, la fiecare secundă; 6 s de liniște = legătură căzută),
   `ENTER 4` [margine, păstrează-poziția, poziție u16], `LEAVE 5` [are-poziție, poziție u16],
   `MOVE 6` [dx i16, dy i16], `BUTTON 7` [buton 1–5, apăsat], `WHEEL 8` [delta i16, orizontal], `KEY 9` [vk, scan, flaguri],
-  `CLIPBOARD 10` [text UTF-8].
-- Audio va pleca separat, pe UDP, ca să nu fie blocat de un transfer de fișiere.
+  `CLIPBOARD 10` [text UTF-8], `AUDIO 11`, `AUDIO_STATE 12`.
 
 **Sunet (controlat → principal):**
 - Vista și mai nou: WASAPI loopback, adică exact ce se aude pe ieșirea implicită.
 - XP: `waveIn` de pe dispozitivul „Stereo Mix” / „What U Hear”. **Depinde de placa de sunet:** dacă
   driverul nu oferă acest dispozitiv, pe XP nu putem capta sunetul fără un driver virtual.
-- Trimitem PCM 16-bit stereo la 44.1/48 kHz (~1.5 Mbit/s), fără codec, ceea ce e neglijabil în LAN.
-  Principalul redă prin `waveOut`, cu un jitter buffer de ~60–100 ms.
+- Trimitem PCM 16-bit stereo la rata mixerului (de obicei 48 kHz, ~1.5 Mbit/s), fără codec, în bucăți de
+  20 ms, pe aceeași legătură TCP criptată (`AUDIO 11` [rată u32][cadre], `AUDIO_STATE 12` [1 loopback,
+  2 Stereo Mix, 3 nimic]). Bucățile de liniște completă nu se trimit. Am ales TCP în loc de UDP: nu mai e nevoie
+  de un port în plus, iar cadrele de 20 ms trec printre bucățile unui transfer de fișiere.
+- Principalul redă prin `waveOut`: pornește după 60 ms în coadă și aruncă bucățile care ar duce coada peste
+  250 ms, ca latența să rămână mică și deriva dintre ceasurile plăcilor de sunet să nu se adune.
+- Pe Vista+, controlatul se aude în continuare și pe boxele lui.
 
 **Clipboard text:** la fiecare comutare, PC-ul care cedează inputul trimite `CF_UNICODETEXT` ca UTF-8 (`CLIPBOARD 10`), înaintea lui `ENTER`/`LEAVE`, dar numai dacă s-a schimbat de la ultima trimitere sau primire (`GetClipboardSequenceNumber`), ca textul să nu se întoarcă în ecou. UTF-8 invalid e ignorat. Textele peste 64 KB rămân pe loc.
 
@@ -71,7 +75,7 @@ lipește unde vrei. Fișierele mai mari decât o limită din config nu se trimit
 1. **M0** ✅ Toolchain + schelet: `bridger.exe` cu fereastră și tray, instanță unică, installer NSIS, build XP-compatibil verificat (`tools/check_xp_imports.py`).
 2. **M1** ✅ (testat pe Win11 contra unor parteneri falși; **netestat încă pe XP real**) Rețea + criptare + mouse/tastatură: margine, dublu-tap, urgență, reconectare. Teste: `build/link_test.exe` (în build), `tests/fake_main.c`, `tests/fake_controlled.c`.
 3. **M2** ✅ Clipboard text (testat pe Win11 în ambele sensuri cu `tests/fake_main.c`).
-4. **M3** Sunet (WASAPI pe Vista+, Stereo Mix pe XP).
+4. **M3** ✅ Sunet (WASAPI pe Vista+, Stereo Mix pe XP). Testat pe Win11: captura cu `fake_main audio`, redarea cu `fake_controlled 3 tone`. **Stereo Mix pe XP netestat.**
 5. **M4** Transfer fișiere prin copy/paste.
 6. **M5** Autoupdate: GitHub Releases → principal → controlați (inclusiv XP), cu installerul rulat silențios (`/S`).
 7. **M6** Extra din Multiplicity, doar dacă le vrei: mai multe PC-uri controlate, blocare/screensaver
