@@ -123,6 +123,7 @@ static struct {
 } g;
 
 static int S(int px) { return MulDiv(px, g.dpi, 96); }
+static void redraw(const RECT *r);
 
 static const int SIDEBAR = 280, FOOTER = 96, NAV_H = 52, STATUS_H = 132;
 
@@ -400,7 +401,7 @@ static void apply_theme(void)
         if (set) set(g.wnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
         FreeLibrary(dwm);
     }
-    InvalidateRect(g.wnd, NULL, TRUE);
+    redraw(NULL);
 }
 
 static COLORREF color(int c)
@@ -844,14 +845,23 @@ static void layout(void)
     ReleaseDC(g.wnd, lay_dc);
 }
 
-static void paint(HDC win)
+/* The window's picture is drawn once into a cached bitmap and only redrawn when its content changes
+ * (redraw()). A window dragged across it on Windows XP, which has no compositor, then costs a copy of
+ * the uncovered strip instead of a full redraw (measured 100-500 ms in an XP virtual machine). */
+static struct { HBITMAP bmp; int w, h; BOOL dirty, all; RECT part; } cache;
+
+/* r: the part whose content changed (the once-a-second response time); NULL: everything. */
+static void redraw(const RECT *r)
+{
+    if (r) UnionRect(&cache.part, &cache.part, r);
+    else cache.all = TRUE;
+    cache.dirty = TRUE;
+    InvalidateRect(g.wnd, r, FALSE);
+}
+
+static void render(HDC dc, RECT c)
 {
     const Palette *p = g.p;
-    RECT c;
-    GetClientRect(g.wnd, &c);
-    HDC dc = CreateCompatibleDC(win);
-    HBITMAP bmp = CreateCompatibleBitmap(win, c.right, c.bottom);
-    HGDIOBJ old = SelectObject(dc, bmp);
     fill(dc, &c, p->ground);
 
     int fy = c.bottom - S(FOOTER);
@@ -907,10 +917,33 @@ static void paint(HDC win)
     SetRect(&r, S(28), fy + S(18), c.right - S(260), c.bottom - S(18));
     text(dc, L"Changes apply as you make them. Closing this window keeps Nexus running in the tray.", r,
          g.body, p->ink2, DT_WORDBREAK);
+}
 
-    BitBlt(win, 0, 0, c.right, c.bottom, dc, 0, 0, SRCCOPY);
+static void paint(HDC win, const RECT *dirty_part)
+{
+    RECT c;
+    GetClientRect(g.wnd, &c);
+    if (!cache.bmp || cache.w != c.right || cache.h != c.bottom) {
+        if (cache.bmp) DeleteObject(cache.bmp);
+        cache.bmp = CreateCompatibleBitmap(win, c.right, c.bottom);
+        cache.w = c.right, cache.h = c.bottom, cache.dirty = cache.all = TRUE;
+    }
+    HDC dc = CreateCompatibleDC(win);
+    HGDIOBJ old = SelectObject(dc, cache.bmp);
+    if (cache.dirty) {
+        if (!cache.all) { /* clipped, so GDI skips drawing everything outside the changed part */
+            HRGN part = CreateRectRgnIndirect(&cache.part);
+            SelectClipRgn(dc, part);
+            DeleteObject(part);
+        }
+        render(dc, c);
+        SelectClipRgn(dc, NULL);
+        SetRectEmpty(&cache.part);
+        cache.dirty = cache.all = FALSE;
+    }
+    BitBlt(win, dirty_part->left, dirty_part->top, dirty_part->right - dirty_part->left,
+           dirty_part->bottom - dirty_part->top, dc, dirty_part->left, dirty_part->top, SRCCOPY);
     SelectObject(dc, old);
-    DeleteObject(bmp);
     DeleteDC(dc);
 }
 
@@ -918,7 +951,7 @@ static void refresh(void)
 {
     status_text();
     layout();
-    InvalidateRect(g.wnd, NULL, FALSE);
+    redraw(NULL);
     for (int i = 0; i < NPAGES; i++) InvalidateRect(g.nav[i], NULL, FALSE);
     for (int i = 0; i < 4; i++) InvalidateRect(g.edge[i], NULL, FALSE);
     for (int i = 0; i < 2; i++) InvalidateRect(g.role[i], NULL, FALSE);
@@ -1141,7 +1174,7 @@ static void on_net_msg(unsigned char *msg, int len)
         DWORD sent = msg[1] | msg[2] << 8 | msg[3] << 16 | (DWORD)msg[4] << 24;
         g.rtt = (int)(GetTickCount() - sent);
         RECT r = {0, 0, S(SIDEBAR), S(STATUS_H)};
-        InvalidateRect(g.wnd, &r, FALSE);
+        redraw(&r);
     } else if (g.cfg.role == ROLE_MAIN) {
         if (msg[0] == MSG_LEAVE && len == 4) input_main_leave(msg[1] ? msg[2] | msg[3] << 8 : -1);
         else if (msg[0] == MSG_AUDIO) audio_play(msg, len);
@@ -1182,7 +1215,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_SIZE:
         layout();
-        InvalidateRect(w, NULL, FALSE);
+        redraw(NULL);
         return 0;
     case WM_GETMINMAXINFO:
         ((MINMAXINFO *)lp)->ptMinTrackSize.x = S(760);
@@ -1192,7 +1225,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        paint(BeginPaint(w, &ps));
+        paint(BeginPaint(w, &ps), &ps.rcPaint);
         EndPaint(w, &ps);
         return 0;
     }
@@ -1215,7 +1248,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             refresh();
         } else if ((id == ID_PASSWORD || id == ID_PEER) && (code == EN_SETFOCUS || code == EN_KILLFOCUS)) {
             if (code == EN_KILLFOCUS) apply_field((HWND)lp);
-            InvalidateRect(w, &g.module_rc, FALSE);
+            redraw(&g.module_rc);
         } else if (id == ID_QUIT || id == ID_TRAY_QUIT) quit();
         else if (id == ID_TRAY_OPEN) show_window();
         else if (id == ID_SITE) ShellExecuteW(NULL, L"open", SITE_URL, NULL, NULL, SW_SHOWNORMAL);
