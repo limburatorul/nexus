@@ -252,3 +252,6 @@ gdi32.dll!selectcliprgn
 user32.dll!setrectempty
 user32.dll!unionrect
 msvcrt.dll!strchr
+ws2_32.dll!htonl
+ws2_32.dll!recvfrom
+ws2_32.dll!sendto

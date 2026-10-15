@@ -28,12 +28,18 @@
 #define WM_TEST (WM_APP + 7)         /* wParam: command, lParam: reply buffer (test mode) */
 #define TEST_LINK_PORT 24810         /* a test profile beside the real one, see "/test" */
 #define TEST_CONTROL_PORT 24811
+#define DISCOVERY_PORT 24802
+#define TEST_DISCOVERY_PORT 24812
+#define WM_FOUND (WM_APP + 8)        /* lParam: malloc'd Found, freed here */
+#define MAX_FOUND 4
 #define TIMER_PING 1
 
 enum { ID_TRAY_OPEN = 1, ID_TRAY_QUIT, ID_NAV0 = 100, ID_QUIT = 200, ID_SITE, ID_SETUP, ID_ROLE0, ID_ROLE1,
-       ID_EDGE0, ID_EDGE3 = ID_EDGE0 + 3, ID_PASSWORD, ID_PEER, ID_PASSWORD_LABEL, ID_PEER_LABEL, ID_UPDATE };
+       ID_EDGE0, ID_EDGE3 = ID_EDGE0 + 3, ID_PASSWORD, ID_PEER, ID_PASSWORD_LABEL, ID_PEER_LABEL, ID_UPDATE, ID_FOUND0,
+       ID_FOUND3 = ID_FOUND0 + MAX_FOUND - 1 };
 enum { K_NAV, K_OUTLINE, K_LINK, K_SEGMENT };
 enum { ROLE_MAIN, ROLE_CONTROLLED };
+typedef struct { char ip[16]; wchar_t name[32]; int role; DWORD seen; } Found;
 enum { PAGE_OVERVIEW, PAGE_CROSSING, PAGE_KEYBOARD, PAGE_SOUND, PAGE_FILES, PAGE_CONNECTION };
 #define NO_FILL ((COLORREF)0xFFFFFFFF)
 
@@ -87,6 +93,7 @@ enum { L_TEXT, L_LINE, L_DOT, L_WELL, L_KEYCAP };
 
 static struct {
     HINSTANCE inst;
+    HWND found_btn[MAX_FOUND];
     HWND wnd, hover, nav[NPAGES], quit, site, update, setup, role[2], edge[4], pw, peer, pw_label, peer_label;
     WNDPROC button_proc;
     NOTIFYICONDATAW tray;
@@ -112,7 +119,10 @@ static struct {
     int gen;
     char my_name[64];
     BOOL test; /* started with /test: own profile and ports, no hooks, driven over TEST_CONTROL_PORT */
-    int port;
+    int port, discovery_port;
+    SOCKET discovery;
+    Found found[MAX_FOUND]; /* other Nexus PCs answering on this network */
+    unsigned long local_ip[4], broadcast[4];
     const wchar_t *app_class;
     wchar_t peer_name[64];
     char peer_version[16]; /* "" from a Nexus too old to say */
@@ -297,6 +307,107 @@ static int session(SOCKET s, int role, const unsigned char key[32])
     }
 }
 
+
+/* ---- discovery: who else runs Nexus on this network ----
+ * UDP: "NXUS?" asks, every Nexus answers "NXUS!" + its role + its version + NUL + its name. Nothing
+ * here is secret or trusted: an answer only fills in an address, connecting still needs the password. */
+
+static DWORD WINAPI discovery_thread(void *unused)
+{
+    (void)unused;
+    unsigned char buf[160], reply[128];
+    struct sockaddr_in from;
+    for (;;) {
+        int len = sizeof from;
+        int n = recvfrom(g.discovery, (char *)buf, sizeof buf - 1, 0, (struct sockaddr *)&from, &len);
+        if (n <= 0) { /* an ICMP "port unreachable" for an earlier probe shows up here: not fatal */
+            Sleep(50);
+            continue;
+        }
+        BOOL mine = FALSE;
+        for (int i = 0; i < 4; i++) mine |= g.local_ip[i] && g.local_ip[i] == from.sin_addr.s_addr;
+        if (n == 5 && !memcmp(buf, "NXUS?", 5)) {
+            int v = (int)strlen(NEXUS_VERSION), m = (int)strlen(g.my_name);
+            memcpy(reply, "NXUS!", 5);
+            reply[5] = (unsigned char)g.cfg.role;
+            memcpy(reply + 6, NEXUS_VERSION, v);
+            reply[6 + v] = 0;
+            memcpy(reply + 7 + v, g.my_name, m);
+            sendto(g.discovery, (const char *)reply, 7 + v + m, 0, (struct sockaddr *)&from, len);
+        } else if (!mine && n > 8 && !memcmp(buf, "NXUS!", 5) && buf[5] <= ROLE_CONTROLLED) {
+            buf[n] = 0;
+            const char *name = memchr(buf + 6, 0, n - 6);
+            Found *f = calloc(1, sizeof *f);
+            if (!name || !f || !strcmp(name + 1, g.my_name)) { /* our own answer, from one of our addresses */
+                free(f);
+                continue;
+            }
+            lstrcpynA(f->ip, inet_ntoa(from.sin_addr), 16);
+            MultiByteToWideChar(CP_UTF8, 0, name + 1, -1, f->name, 31);
+            f->role = buf[5];
+            f->seen = GetTickCount();
+            if (!PostMessageW(g.wnd, WM_FOUND, 0, (LPARAM)f)) free(f);
+        }
+    }
+    return 0;
+}
+
+static void discovery_start(void)
+{
+    struct sockaddr_in a = {0};
+    BOOL on = TRUE;
+    a.sin_family = AF_INET;
+    a.sin_port = htons(g.discovery_port);
+    g.discovery = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(g.discovery, SOL_SOCKET, SO_BROADCAST, (char *)&on, sizeof on);
+    if (bind(g.discovery, (struct sockaddr *)&a, sizeof a) != 0) { /* another program has the port */
+        closesocket(g.discovery);
+        g.discovery = INVALID_SOCKET;
+        return;
+    }
+    CloseHandle(CreateThread(NULL, 0, discovery_thread, NULL, 0, NULL));
+}
+
+/* Main PC: ask every few seconds. Windows sends 255.255.255.255 out of one adapter only, so each
+ * local network gets its own broadcast too. */
+static void discovery_probe(void)
+{
+    struct sockaddr_in to = {0};
+    if (g.discovery == INVALID_SOCKET) return;
+    to.sin_family = AF_INET;
+    to.sin_port = htons(g.discovery_port);
+    to.sin_addr.s_addr = INADDR_BROADCAST;
+    sendto(g.discovery, "NXUS?", 5, 0, (struct sockaddr *)&to, sizeof to);
+    for (int i = 0; i < 4 && g.broadcast[i]; i++) {
+        to.sin_addr.s_addr = g.broadcast[i];
+        sendto(g.discovery, "NXUS?", 5, 0, (struct sockaddr *)&to, sizeof to);
+    }
+}
+
+/* An answer: kept by address, the oldest making room. Returns whether the list on screen changes. */
+static BOOL discovery_found(const Found *f)
+{
+    int slot = 0;
+    for (int i = 0; i < MAX_FOUND; i++) {
+        if (!strcmp(g.found[i].ip, f->ip)) {
+            BOOL changed = g.found[i].role != f->role || lstrcmpW(g.found[i].name, f->name);
+            g.found[i] = *f;
+            return changed;
+        }
+        if (g.found[i].seen < g.found[slot].seen) slot = i;
+    }
+    g.found[slot] = *f;
+    return TRUE;
+}
+
+static BOOL discovery_expire(void) /* PCs not heard from for 10 s are gone */
+{
+    BOOL changed = FALSE;
+    for (int i = 0; i < MAX_FOUND; i++)
+        if (g.found[i].ip[0] && GetTickCount() - g.found[i].seen > 10000) memset(&g.found[i], 0, sizeof g.found[i]), changed = TRUE;
+    return changed;
+}
+
 static DWORD WINAPI net_thread(void *unused)
 {
     (void)unused;
@@ -466,6 +577,8 @@ static void this_pc_addresses(void)
     for (int i = 0; h->h_addr_list[i] && i < 4; i++) {
         struct in_addr a;
         memcpy(&a, h->h_addr_list[i], 4);
+        g.local_ip[i] = a.s_addr;
+        g.broadcast[i] = a.s_addr | htonl(0xFF); /* ponytail: assumes /24, which home networks are */
         wchar_t one[24];
         _snwprintf(one, 24, i ? L", %hs" : L"%hs", inet_ntoa(a));
         one[23] = 0;
@@ -630,7 +743,7 @@ static void draw_control(const DRAWITEMSTRUCT *d)
         int kind = (int)GetWindowLongPtrW(d->hwndItem, GWLP_USERDATA);
         BOOL hover = d->hwndItem == g.hover || (d->itemState & ODS_SELECTED);
         BOOL focus = (d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT);
-        BOOL in_module = kind == K_SEGMENT || d->CtlID == ID_SETUP;
+        BOOL in_module = kind == K_SEGMENT || d->CtlID == ID_SETUP || (d->CtlID >= ID_FOUND0 && d->CtlID <= ID_FOUND3);
         COLORREF bg = in_module ? p->panel : p->ground;
         fill(dc, &r, bg);
         if (kind == K_NAV) {
@@ -706,7 +819,8 @@ static void layout(void)
 {
     static wchar_t detail[192], address_line[192];
     HWND page_controls[] = {g.setup, g.role[0], g.role[1], g.edge[0], g.edge[1], g.edge[2], g.edge[3],
-                            g.pw, g.peer, g.pw_label, g.peer_label};
+                            g.pw, g.peer, g.pw_label, g.peer_label, g.found_btn[0], g.found_btn[1], g.found_btn[2],
+                            g.found_btn[3]};
     for (int i = 0; i < (int)(sizeof page_controls / sizeof page_controls[0]); i++) ShowWindow(page_controls[i], SW_HIDE);
 
     RECT c;
@@ -804,9 +918,22 @@ static void layout(void)
             y = add_field_row(mx, y, fw, g.pw_label, g.pw,
                               g.cfg.has_key ? L"Set. Type a new one and press Enter to change it."
                                             : L"Type the same password on both PCs and press Enter.");
-            if (main_pc)
+            if (main_pc) {
                 y = add_field_row(mx, y, fw, g.peer_label, g.peer,
                                   L"The controlled PC shows its address on its own Connection page.");
+                int listed = 0;
+                for (int i = 0; i < MAX_FOUND; i++)
+                    if (g.found[i].ip[0] && g.found[i].role == ROLE_CONTROLLED) {
+                        static wchar_t labels[MAX_FOUND][64];
+                        if (!listed++) y = add_text(mx, y - S(12), fw, L"Found on this network:", g.small, C_INK3) + S(4);
+                        _snwprintf(labels[i], 64, L"%ls  \x00b7  %hs", g.found[i].name, g.found[i].ip);
+                        labels[i][63] = 0;
+                        SetWindowTextW(g.found_btn[i], labels[i]);
+                        place(g.found_btn[i], mx, y, fw, S(28));
+                        y += S(30);
+                    }
+                if (listed) y += S(16);
+            }
         }
         _snwprintf(address_line, 192, L"This PC's address: %ls  ·  port %d", g.addresses, g.port);
         address_line[191] = 0;
@@ -1225,6 +1352,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         g.peer = add_field(L"Controlled PC's address", ID_PEER_LABEL, ID_PEER, 0, &g.peer_label);
         SetWindowTextW(g.peer, g.cfg.peer);
         g.site = add_button(L"Nexus on GitHub", ID_SITE, K_LINK);
+        for (int i = 0; i < MAX_FOUND; i++) g.found_btn[i] = add_button(L"", ID_FOUND0 + i, K_LINK);
         g.update = add_button(L"", ID_UPDATE, K_LINK);
         g.quit = add_button(L"Quit Nexus", ID_QUIT, K_OUTLINE);
         apply_theme();
@@ -1272,9 +1400,24 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         else if (id == ID_TRAY_OPEN) show_window();
         else if (id == ID_SITE) ShellExecuteW(NULL, L"open", SITE_URL, NULL, NULL, SW_SHOWNORMAL);
         else if (id == ID_UPDATE) install_update();
+        else if (id >= ID_FOUND0 && id <= ID_FOUND3 && g.found[id - ID_FOUND0].ip[0]) {
+            EnterCriticalSection(&g.cs);
+            MultiByteToWideChar(CP_ACP, 0, g.found[id - ID_FOUND0].ip, -1, g.cfg.peer, 128);
+            LeaveCriticalSection(&g.cs);
+            SetWindowTextW(g.peer, g.cfg.peer);
+            config_save();
+            net_restart();
+            refresh();
+        }
         return 0;
     }
+    case WM_FOUND:
+        if (discovery_found((const Found *)lp) && g.page == PAGE_CONNECTION) refresh();
+        free((void *)lp);
+        return 0;
     case WM_TIMER:
+        if (discovery_expire() && g.page == PAGE_CONNECTION) refresh();
+        if (g.cfg.role == ROLE_MAIN && GetTickCount() / 1000 % 3 == 0) discovery_probe();
         if (g.status == NS_CONNECTED) {
             DWORD t = GetTickCount();
             unsigned char ping[5] = {MSG_PING, (BYTE)t, (BYTE)(t >> 8), (BYTE)(t >> 16), (BYTE)(t >> 24)};
@@ -1490,6 +1633,16 @@ static void test_command(const char *cmd, char *out)
         long size;
         unsigned long h = fnv(warg, &size);
         _snprintf(out, cap, "%ld %08lx", size, h);
+    } else if (!strncmp(cmd, "found", 5)) {
+        int at = 0;
+        out[0] = 0;
+        for (int i = 0; i < MAX_FOUND && at < cap - 100; i++)
+            if (g.found[i].ip[0]) {
+                char name[64];
+                WideCharToMultiByte(CP_UTF8, 0, g.found[i].name, -1, name, sizeof name, NULL, NULL);
+                at += _snprintf(out + at, cap - at, "%s%s %s %s", at ? "|" : "", g.found[i].ip,
+                                g.found[i].role == ROLE_MAIN ? "main" : "controlled", name);
+            }
     } else if (!strncmp(cmd, "temp", 4)) {
         wchar_t t[MAX_PATH];
         GetTempPathW(MAX_PATH, t);
@@ -1531,6 +1684,7 @@ static DWORD WINAPI test_thread(void *unused)
                 }
         closesocket(s);
     }
+    return 0;
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
@@ -1592,6 +1746,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     else update_start(g.wnd, is_main_pc);
     sync_input();
     CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));
+    g.discovery_port = g.test ? TEST_DISCOVERY_PORT : DISCOVERY_PORT;
+    discovery_start();
     /* Started at sign-in with /tray: stay in the tray until asked. */
     if (!wcsstr(cmd, L"/tray")) ShowWindow(g.wnd, show);
 
