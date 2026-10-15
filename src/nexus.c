@@ -17,7 +17,6 @@
 
 #define WIDEN2(s) L##s
 #define WIDEN(s) WIDEN2(s)
-#define APP_CLASS L"NexusWnd"
 #define SITE_URL L"https://github.com/limburatorul/nexus"
 
 #define WM_TRAY (WM_APP + 1)
@@ -26,6 +25,9 @@
 #define WM_NET_STATUS (WM_APP + 4)   /* wParam: NS_* */
 #define WM_NET_MSG (WM_APP + 5)      /* wParam: length, lParam: malloc'd message, freed here */
 #define WM_AUDIO_STATE (WM_APP + 6)  /* wParam: AUDIO_* of this controlled PC */
+#define WM_TEST (WM_APP + 7)         /* wParam: command, lParam: reply buffer (test mode) */
+#define TEST_LINK_PORT 24810         /* a test profile beside the real one, see "/test" */
+#define TEST_CONTROL_PORT 24811
 #define TIMER_PING 1
 
 enum { ID_TRAY_OPEN = 1, ID_TRAY_QUIT, ID_NAV0 = 100, ID_QUIT = 200, ID_SITE, ID_SETUP, ID_ROLE0, ID_ROLE1,
@@ -109,6 +111,9 @@ static struct {
     BOOL link_up;
     int gen;
     char my_name[64];
+    BOOL test; /* started with /test: own profile and ports, no hooks, driven over TEST_CONTROL_PORT */
+    int port;
+    const wchar_t *app_class;
     wchar_t peer_name[64];
     char peer_version[16]; /* "" from a Nexus too old to say */
 
@@ -124,6 +129,7 @@ static struct {
 
 static int S(int px) { return MulDiv(px, g.dpi, 96); }
 static void redraw(const RECT *r);
+static void test_command(const char *cmd, char *out);
 
 static const int SIDEBAR = 280, FOOTER = 96, NAV_H = 52, STATUS_H = 132;
 
@@ -135,7 +141,7 @@ static void config_load(void)
     SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, g.ini);
     wcscat(g.ini, L"\\Nexus");
     CreateDirectoryW(g.ini, NULL);
-    wcscat(g.ini, L"\\nexus.ini");
+    wcscat(g.ini, g.test ? L"\\test.ini" : L"\\nexus.ini");
 
     GetPrivateProfileStringW(L"nexus", L"role", L"main", v, 128, g.ini);
     g.cfg.role = lstrcmpiW(v, L"controlled") == 0 ? ROLE_CONTROLLED : ROLE_MAIN;
@@ -194,7 +200,7 @@ static SOCKET dial(const char *host)
 {
     struct sockaddr_in a = {0};
     a.sin_family = AF_INET;
-    a.sin_port = htons(LINK_PORT);
+    a.sin_port = htons(g.port);
     a.sin_addr.s_addr = inet_addr(host);
     if (a.sin_addr.s_addr == INADDR_NONE) {
         struct hostent *h = gethostbyname(host);
@@ -224,7 +230,7 @@ static SOCKET listen_socket(void)
     if (g.listener == INVALID_SOCKET) {
         struct sockaddr_in a = {0};
         a.sin_family = AF_INET;
-        a.sin_port = htons(LINK_PORT);
+        a.sin_port = htons(g.port);
         SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
         if (bind(s, (struct sockaddr *)&a, sizeof a) == 0 && listen(s, 2) == 0) g.listener = s;
         else closesocket(s);
@@ -748,8 +754,8 @@ static void layout(void)
                   g.status == NS_CONNECTED && g.peer_name[0] ? g.peer_name : main_pc ? g.cfg.peer : L"Main PC",
                   g.status_font, C_INK, NULL);
         y += S(30);
-        if (main_pc) _snwprintf(detail, 192, L"Controlled PC  ·  %ls  ·  port %d", g.cfg.peer, LINK_PORT);
-        else _snwprintf(detail, 192, L"Main PC  ·  connects to this PC on port %d", LINK_PORT);
+        if (main_pc) _snwprintf(detail, 192, L"Controlled PC  ·  %ls  ·  port %d", g.cfg.peer, g.port);
+        else _snwprintf(detail, 192, L"Main PC  ·  connects to this PC on port %d", g.port);
         detail[191] = 0;
         add_label(L_LINE, mx, y, mw, S(22), detail, g.body, C_INK3, NULL);
         y += S(30);
@@ -802,7 +808,7 @@ static void layout(void)
                 y = add_field_row(mx, y, fw, g.peer_label, g.peer,
                                   L"The controlled PC shows its address on its own Connection page.");
         }
-        _snwprintf(address_line, 192, L"This PC's address: %ls  ·  port %d", g.addresses, LINK_PORT);
+        _snwprintf(address_line, 192, L"This PC's address: %ls  ·  port %d", g.addresses, g.port);
         address_line[191] = 0;
         y = add_text(mx, y, mw, address_line, g.body, C_INK2);
         break;
@@ -1176,7 +1182,10 @@ static void on_net_msg(unsigned char *msg, int len)
         RECT r = {0, 0, S(SIDEBAR), S(STATUS_H)};
         redraw(&r);
     } else if (g.cfg.role == ROLE_MAIN) {
-        if (msg[0] == MSG_LEAVE && len == 4) input_main_leave(msg[1] ? msg[2] | msg[3] << 8 : -1);
+        if (msg[0] == MSG_LEAVE && len == 4) {
+            input_main_leave(msg[1] ? msg[2] | msg[3] << 8 : -1);
+            if (g.test) g.remote = FALSE, refresh(); /* no hook thread to report it */
+        }
         else if (msg[0] == MSG_AUDIO) audio_play(msg, len);
         else if (msg[0] == MSG_AUDIO_STATE && len == 2 && msg[1] <= AUDIO_NONE && msg[1] != g.audio_state)
             g.audio_state = msg[1], refresh();
@@ -1211,6 +1220,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         g.quit = add_button(L"Quit Nexus", ID_QUIT, K_OUTLINE);
         apply_theme();
         tray_add();
+        status_text(); /* the first status the network reports may equal the initial one */
         SetTimer(w, TIMER_PING, 1000, NULL);
         return 0;
     case WM_SIZE:
@@ -1323,6 +1333,9 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         clipboard_set_files((const wchar_t *)lp);
         free((void *)lp);
         return 0;
+    case WM_TEST:
+        test_command((const char *)wp, (char *)lp);
+        return 0;
     case WM_AUDIO_STATE:
         g.audio_state = (int)wp;
         refresh();
@@ -1359,12 +1372,167 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     return DefWindowProcW(w, m, wp, lp);
 }
 
+
+/* ---- test mode ("/test"): a script drives this instance over TEST_CONTROL_PORT ----
+ * The driver connects with the same password as the link (it plays the main role in the
+ * handshake), sends MSG_TEST + a command and gets MSG_TEST + the answer. Commands run on the UI
+ * thread, so they touch the same state as clicks. tests/driver.py lists them. */
+
+static void put_files(const char *list) /* "a|b|c", as Explorer's Copy would put them */
+{
+    wchar_t paths[2048];
+    int n = MultiByteToWideChar(CP_UTF8, 0, list, -1, paths, 2047);
+    if (n <= 0) return;
+    for (int i = 0; i < n; i++)
+        if (paths[i] == L'|') paths[i] = 0;
+    paths[n] = 0; /* double NUL */
+    clipboard_set_files(paths);
+}
+
+static unsigned long fnv(const wchar_t *path, long *size)
+{
+    unsigned long h = 2166136261UL;
+    unsigned char buf[8192];
+    DWORD got;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    *size = -1;
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    *size = 0;
+    while (ReadFile(f, buf, sizeof buf, &got, NULL) && got)
+        for (DWORD i = 0; i < got; i++) h = (h ^ buf[i]) * 16777619UL, ++*size;
+    CloseHandle(f);
+    return h;
+}
+
+static void test_command(const char *cmd, char *out)
+{
+    const int cap = 4096;
+    char arg[2048] = "";
+    wchar_t warg[1024] = L"";
+    const char *sp = strchr(cmd, ' ');
+    if (sp) {
+        lstrcpynA(arg, sp + 1, sizeof arg);
+        MultiByteToWideChar(CP_UTF8, 0, arg, -1, warg, 1024);
+    }
+    lstrcpynA(out, "ok", cap);
+    if (!strncmp(cmd, "status", 6)) {
+        char peer[64], note[512];
+        WideCharToMultiByte(CP_UTF8, 0, g.peer_name, -1, peer, sizeof peer, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, g.files_note, -1, note, sizeof note, NULL, NULL);
+        _snprintf(out, cap, "role=%s status=%d peer=%s peer_version=%s remote=%d active=%d audio=%d version=%s files=%s",
+                  g.cfg.role == ROLE_MAIN ? "main" : "controlled", g.status, peer, g.peer_version, g.remote,
+                  input_controlled_active(), g.audio_state, NEXUS_VERSION, note);
+    } else if (!strncmp(cmd, "cross", 5) && g.cfg.role == ROLE_MAIN && g.status == NS_CONNECTED) {
+        unsigned char enter[5] = {MSG_ENTER, (BYTE)g.cfg.edge, 1 /* pointer stays where it is */, 0, 0};
+        clipboard_send(); /* what a real crossing sends first */
+        net_send(enter, 5);
+        g.remote = TRUE, refresh();
+    } else if (!strncmp(cmd, "home", 4) && g.cfg.role == ROLE_MAIN) {
+        unsigned char leave[4] = {MSG_LEAVE, 0, 0, 0};
+        net_send(leave, 4);
+        g.remote = FALSE, refresh();
+    } else if (!strncmp(cmd, "move ", 5)) {
+        char *end;
+        int dx = (int)strtol(arg, &end, 10), dy = (int)strtol(end, NULL, 10);
+        unsigned char m[5] = {MSG_MOVE, (BYTE)dx, (BYTE)(dx >> 8), (BYTE)dy, (BYTE)(dy >> 8)};
+        net_send(m, 5);
+    } else if (!strncmp(cmd, "cursor", 6)) {
+        POINT p;
+        GetCursorPos(&p);
+        _snprintf(out, cap, "%ld %ld", p.x, p.y);
+    } else if (!strncmp(cmd, "clip-set ", 9)) {
+        clipboard_set((const unsigned char *)arg, (int)strlen(arg));
+        clip_seq = 0; /* as if the user copied it: it travels on the next switch */
+    } else if (!strncmp(cmd, "files ", 6)) {
+        put_files(arg);
+        clip_seq = 0;
+    } else if (!strncmp(cmd, "clip-get", 8)) {
+        lstrcpynA(out, "empty", cap);
+        if (OpenClipboard(g.wnd)) {
+            HDROP drop = GetClipboardData(CF_HDROP);
+            HANDLE h = GetClipboardData(CF_UNICODETEXT);
+            if (drop) {
+                int n = (int)DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0), at = 6;
+                lstrcpynA(out, "files:", cap);
+                for (int i = 0; i < n && at < cap - 600; i++) {
+                    wchar_t f[MAX_PATH];
+                    DragQueryFileW(drop, i, f, MAX_PATH);
+                    if (i) out[at++] = '|';
+                    at += WideCharToMultiByte(CP_UTF8, 0, f, -1, out + at, cap - at, NULL, NULL) - 1;
+                }
+            } else if (h) {
+                const wchar_t *w = GlobalLock(h);
+                lstrcpynA(out, "text:", cap);
+                if (w) WideCharToMultiByte(CP_UTF8, 0, w, -1, out + 5, cap - 5, NULL, NULL), GlobalUnlock(h);
+            }
+            CloseClipboard();
+        }
+    } else if (!strncmp(cmd, "write ", 6)) { /* write <path>|<text> */
+        wchar_t *bar = wcschr(warg, L'|');
+        char *text = strchr(arg, '|');
+        DWORD n;
+        if (!bar || !text) return (void)lstrcpynA(out, "usage: write path|text", cap);
+        *bar = 0;
+        HANDLE f = CreateFileW(warg, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (f == INVALID_HANDLE_VALUE) return (void)lstrcpynA(out, "cannot write", cap);
+        WriteFile(f, text + 1, (DWORD)strlen(text + 1), &n, NULL);
+        CloseHandle(f);
+    } else if (!strncmp(cmd, "fnv ", 4)) {
+        long size;
+        unsigned long h = fnv(warg, &size);
+        _snprintf(out, cap, "%ld %08lx", size, h);
+    } else if (!strncmp(cmd, "temp", 4)) {
+        wchar_t t[MAX_PATH];
+        GetTempPathW(MAX_PATH, t);
+        WideCharToMultiByte(CP_UTF8, 0, t, -1, out, cap, NULL, NULL);
+    } else if (!strncmp(cmd, "quit", 4)) {
+        PostMessageW(g.wnd, WM_NEXUS_QUIT, 0, 0);
+    } else {
+        lstrcpynA(out, "unknown or not now", cap);
+    }
+    out[cap - 1] = 0;
+}
+
+static DWORD WINAPI test_thread(void *unused)
+{
+    (void)unused;
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(TEST_CONTROL_PORT);
+    SOCKET ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (bind(ls, (struct sockaddr *)&a, sizeof a) != 0 || listen(ls, 1) != 0) return 0;
+    static unsigned char in[LINK_MAX + 1], out[1 + 4096];
+    for (;;) {
+        SOCKET s = accept(ls, NULL, NULL);
+        if (s == INVALID_SOCKET) continue;
+        unsigned char key[32];
+        char peer[64], peer_version[16];
+        Link l;
+        EnterCriticalSection(&g.cs);
+        memcpy(key, g.cfg.key, 32);
+        LeaveCriticalSection(&g.cs);
+        int n;
+        if (link_handshake(&l, s, 0, key, g.my_name, NEXUS_VERSION, peer, peer_version) == LINK_OK)
+            while ((n = link_recv(&l, in, LINK_MAX)) > 0)
+                if (in[0] == MSG_TEST) {
+                    in[n] = 0;
+                    out[0] = MSG_TEST;
+                    SendMessageW(g.wnd, WM_TEST, (WPARAM)(in + 1), (LPARAM)(out + 1));
+                    if (!link_send(&l, out, 1 + (int)strlen((char *)out + 1))) break;
+                }
+        closesocket(s);
+    }
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
     (void)prev;
-    CreateMutexW(NULL, FALSE, L"Local\\Nexus");
+    g.test = wcsstr(cmd, L"/test") != NULL;
+    g.port = g.test ? TEST_LINK_PORT : LINK_PORT;
+    g.app_class = g.test ? L"NexusTestWnd" : L"NexusWnd";
+    CreateMutexW(NULL, FALSE, g.test ? L"Local\\NexusTest" : L"Local\\Nexus");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND other = FindWindowW(APP_CLASS, NULL);
+        HWND other = FindWindowW(g.app_class, NULL);
         if (other) {
             AllowSetForegroundWindow(ASFW_ANY);
             PostMessageW(other, WM_NEXUS_SHOW, 0, 0);
@@ -1403,15 +1571,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                    GetSystemMetrics(SM_CYSMICON), 0);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = APP_CLASS;
+    wc.lpszClassName = g.app_class;
     RegisterClassExW(&wc);
 
     /* WS_EX_CONTROLPARENT + IsDialogMessage give Tab/Shift+Tab between the controls. */
-    CreateWindowExW(WS_EX_CONTROLPARENT, APP_CLASS, L"Nexus", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+    CreateWindowExW(WS_EX_CONTROLPARENT, g.app_class, g.test ? L"Nexus (test)" : L"Nexus", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                     CW_USEDEFAULT, CW_USEDEFAULT, S(1000), S(800), NULL, NULL, inst, NULL);
-    input_main_start(g.wnd);
+    if (!g.test) input_main_start(g.wnd); /* a test instance leaves this PC's mouse and keys alone */
     files_init(g.wnd, net_send);
-    update_start(g.wnd, is_main_pc);
+    if (g.test) CloseHandle(CreateThread(NULL, 0, test_thread, NULL, 0, NULL));
+    else update_start(g.wnd, is_main_pc);
     sync_input();
     CloseHandle(CreateThread(NULL, 0, net_thread, NULL, 0, NULL));
     /* Started at sign-in with /tray: stay in the tray until asked. */

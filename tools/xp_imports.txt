@@ -251,3 +251,4 @@ gdi32.dll!createrectrgnindirect
 gdi32.dll!selectcliprgn
 user32.dll!setrectempty
 user32.dll!unionrect
+msvcrt.dll!strchr
