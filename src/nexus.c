@@ -1069,9 +1069,20 @@ static void quit(void)
 
 static DWORD clip_seq; /* the clipboard as Nexus last sent or set it: only a newer copy travels */
 
+/* Another program often holds the clipboard for a moment right after a copy (Windows 10/11's
+ * clipboard history does), so one refusal is not an answer. */
+static BOOL open_clipboard(void)
+{
+    for (int i = 0; i < 10; i++) {
+        if (OpenClipboard(g.wnd)) return TRUE;
+        Sleep(20);
+    }
+    return FALSE;
+}
+
 static void clipboard_send(void)
 {
-    if (GetClipboardSequenceNumber() == clip_seq || !OpenClipboard(g.wnd)) return;
+    if (GetClipboardSequenceNumber() == clip_seq || !open_clipboard()) return;
     HANDLE h = GetClipboardData(CF_UNICODETEXT), drop = GetClipboardData(CF_HDROP);
     const wchar_t *w = h && !drop ? GlobalLock(h) : NULL;
     /* Files copied in Explorer go instead of text; a transfer still running keeps the new copy back. */
@@ -1092,9 +1103,7 @@ static void clipboard_send(void)
 /* Takes h whatever happens: it goes on the clipboard or is freed. */
 static void clipboard_put(UINT format, HGLOBAL h)
 {
-    BOOL open = FALSE;
-    for (int i = 0; i < 10 && !(open = OpenClipboard(g.wnd)); i++) Sleep(20); /* another app may hold it a moment */
-    if (!open) {
+    if (!open_clipboard()) {
         GlobalFree(h);
         return;
     }
@@ -1448,7 +1457,7 @@ static void test_command(const char *cmd, char *out)
         clip_seq = 0;
     } else if (!strncmp(cmd, "clip-get", 8)) {
         lstrcpynA(out, "empty", cap);
-        if (OpenClipboard(g.wnd)) {
+        if (open_clipboard()) {
             HDROP drop = GetClipboardData(CF_HDROP);
             HANDLE h = GetClipboardData(CF_UNICODETEXT);
             if (drop) {

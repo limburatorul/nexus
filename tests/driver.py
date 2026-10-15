@@ -88,8 +88,10 @@ def run(main_host: str, controlled_host: str) -> None:
             main("cross")  # input has to be over there before it can come home
             time.sleep(1)
         main(going)
-        got = until("files on %s" % receiver.name,
-                    lambda: receiver("clip-get") if receiver("clip-get").startswith("files:") else None, 20)
+        def arrived():  # the receiver's own earlier copy may still be on its clipboard
+            clip = receiver("clip-get")
+            return clip if clip.startswith("files:") and "Nexus Received" in clip and tag in clip else None
+        got = until("files on %s" % receiver.name, arrived, 20)
         received = got[len("files:"):].split("|")[0]
         assert receiver("fnv " + received) == sent, (receiver("fnv " + received), sent)
         print("ok  file %s -> %s (%s)" % (sender.name, receiver.name, received))
