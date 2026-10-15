@@ -63,6 +63,7 @@ def run(main_host: str, controlled_host: str) -> None:
 
     text = "nexus %s șț é" % tag
     main("clip-set " + text)
+    time.sleep(1)  # Linux: the desktop tells the portal about a copy a moment later
     main("cross")
     until("text on the controlled PC", lambda: ctrl("clip-get") == "text:" + text)
     print("ok  text main -> controlled")
