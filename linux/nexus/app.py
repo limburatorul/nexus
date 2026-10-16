@@ -10,13 +10,13 @@ import tempfile
 import threading
 import time
 
-from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QRect, QRectF, QSize, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
+from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
                                QScrollArea, QSizePolicy, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 from . import VERSION, link, net, sound
-from .config import EDGES, Config
+from .config import EDGES, MAP_H, MAP_W, MAX_PEERS, THIS_PC, Config
 from .discovery import PORT as DISCOVERY_PORT, TEST_PORT as TEST_DISCOVERY_PORT, Discovery
 from .files import Files
 
@@ -44,13 +44,13 @@ STATUS_NOTE = [
     "Another program uses port 24800, so the main PC cannot connect to this one.",
     ""]
 PAGES = [
-    ("Overview", "The PC this one works with, where input is right now, and how the link is doing.", "MACHINE"),
-    ("Crossing", "Which edge of this screen leads to the controlled PC. Push the pointer through it to cross, "
-                 "and back through the facing edge over there to return.", "EDGE"),
+    ("Overview", "The PCs this one works with, where input is right now, and how the links are doing.", "MACHINES"),
+    ("Crossing", "Where the PCs stand around this screen. Push the pointer through an edge to cross to the PC "
+                 "beside it, and on from there to the next one.", "MAP"),
     ("Keyboard", "Switch without the mouse, and a way home that always works.", "SHORTCUTS"),
     ("Sound", "The controlled PC's sound, played on this PC's speakers.", "SOUND"),
-    ("Files", "Copy files on one PC, switch, and paste them on the other.", "FILES"),
-    ("Connection", "This PC's role, the password both PCs share, and where to find the other one.", "THIS PC"),
+    ("Files", "Copy files on one PC, switch, and paste them on another.", "FILES"),
+    ("Connection", "This PC's role, the password all the PCs share, and where to find the others.", "THIS PC"),
 ]
 
 
@@ -67,13 +67,24 @@ def fnv(path: str) -> str:
     return "%d %08x" % (size, h)
 
 
+def at_least(version: str, want) -> bool:
+    try:
+        return tuple(int(v) for v in version.split(".")) >= want
+    except ValueError:
+        return False
+
+
 class Controller(QObject):
-    """Everything Nexus does, on the Qt thread; the network, sound and portal threads report here."""
+    """Everything Nexus does, on the Qt thread; the network, sound and portal threads report here.
+
+    A main PC links to up to four controlled PCs on its map and routes input between them: it goes to
+    the PC past the edge it crossed, and on from there to that PC's neighbour (`target` has it now,
+    `last` had it last). A controlled PC uses session 0 only."""
 
     changed = Signal()
-    crossed = Signal()  # from the capture thread: input went over, the clipboard follows
-    _status = Signal(int)
-    _message = Signal(bytes)
+    crossed = Signal(int, bool)  # input went to a PC, maybe from the capture thread: the clipboard follows
+    _status = Signal(int, int)
+    _message = Signal(int, bytes)
     _note = Signal(str)
     _files_done = Signal(list)
     _found = Signal()
@@ -86,10 +97,16 @@ class Controller(QObject):
         self.cfg = Config.load(test)
         self.port = 24810 if test else link.PORT
         self.name = socket.gethostname()
-        self.status, self.rtt, self.remote, self.audio_state, self.files_note = net.SETUP, None, False, 0, ""
-        self.files = Files(self._send, self._note.emit, self._files_done.emit)
-        self.session = net.Session(self.cfg, self.name, VERSION, self.port, self._status.emit, self._message.emit,
-                                   files=self.files)
+        self.remote, self.target, self.last, self.audio_state, self.files_note = False, -1, -1, 0, ""
+        self.state = [net.SETUP] * MAX_PEERS  # each session's status, as this thread last heard it
+        self.sessions, self.files = [], []
+        for i in range(MAX_PEERS):
+            f = Files(None, self._note.emit, self._files_done.emit)
+            s = net.Session(self.cfg, self.name, VERSION, self.port, lambda st, i=i: self._status.emit(i, st),
+                            lambda m, i=i: self._message.emit(i, m), files=f, index=i)
+            f.send = s.send
+            self.sessions.append(s)
+            self.files.append(f)
         self.sound_capture = sound.Capture(self._send, self._audio.emit)
         self.capture = None  # the main PC's input capture, made when it is the main PC
         self.player = sound.Player()
@@ -111,7 +128,8 @@ class Controller(QObject):
     def start(self) -> None:
         self.injector.start()  # also the clipboard's way in, on either role
         self.start_capture()
-        self.session.start()
+        for s in self.sessions:
+            s.start()
         self.discovery.start()
         self.timer.start()
         if self.test:
@@ -126,49 +144,98 @@ class Controller(QObject):
             self.capture.start()
 
     def _send(self, msg: bytes) -> bool:
-        return self.session.send(msg)
+        """To the PC with input (a controlled PC: to the main PC)."""
+        pc = 0 if self.cfg.role == "controlled" else self.target
+        return pc >= 0 and self.sessions[pc].send(msg)
+
+    # ---- the PCs ----
+
+    def up(self, pc: int) -> bool:
+        return pc == THIS_PC or 0 <= pc < MAX_PEERS and self.state[pc] == net.CONNECTED
+
+    def exits(self, pc: int) -> int:
+        """The edges of a PC (THIS_PC for this one) that lead to a PC that is there."""
+        return sum(1 << e for e in range(4) if self.up(self.cfg.neighbour(pc, e)))
+
+    def first_connected(self) -> int:
+        return next((i for i in range(MAX_PEERS) if self.cfg.peers[i] and self.up(i)), -1)
+
+    def sound_from(self) -> int:
+        """The PC whose sound plays here: the one input went to last, else the first one there."""
+        return self.last if self.last >= 0 and self.up(self.last) else self.first_connected()
+
+    def shown(self) -> int:
+        """The PC the sidebar talks about: where input is, else the one used last, else the first one there."""
+        if self.cfg.role == "controlled":
+            return 0
+        return self.target if self.target >= 0 else self.sound_from()
+
+    @property
+    def status(self) -> int:
+        """This PC's state as a whole: connected while any controlled PC is, else the first one's."""
+        if self.cfg.role == "controlled":
+            return self.state[0]
+        if not self.cfg.ready:
+            return net.SETUP
+        if self.first_connected() >= 0:
+            return net.CONNECTED
+        return next((self.state[i] for i in range(MAX_PEERS) if self.cfg.peers[i]), net.SETUP)
+
+    def name_of(self, pc: int) -> str:
+        if not 0 <= pc < MAX_PEERS:
+            return "the controlled PC" if self.cfg.role == "main" else "the main PC"
+        return self.sessions[pc].peer or self.cfg.peers[pc] or "the main PC"
+
+    def edge_toward(self, pc: int) -> int:
+        """The edge of this PC that faces pc, when it stands beside it; else -1."""
+        return next((e for e in range(4) if self.cfg.neighbour(THIS_PC, e) == pc), -1)
 
     # ---- what the threads report ----
 
-    @Slot(int)
-    def on_status(self, status: int) -> None:
+    @Slot(int, int)
+    def on_status(self, pc: int, status: int) -> None:
+        s = self.sessions[pc]
         if status != net.CONNECTED:
-            if self.capture:
-                self.capture.home(None, tell=False)
-            self.rtt, self.remote, self.audio_state = None, False, 0
-            self.injector.release_all()
-            self.injector.active = False
-            self.sound_capture.stop()
-            self.player.stop()
+            sounding = pc == self.sound_from()
+            if self.cfg.role == "controlled":
+                self.injector.release_all()
+                self.injector.active = False
+                self.sound_capture.stop()
+            elif pc == self.target:  # input was over there: it comes home
+                if self.capture:
+                    self.capture.home(None, None)
+                self.target, self.remote = -1, False
+            if sounding:
+                self.player.stop()
+            s.rtt, s.audio_state = None, 0
         elif self.cfg.role == "controlled":
             self.sound_capture.start()
-        self.status = status
+        self.state[pc] = status
         self.changed.emit()
 
-    @Slot(bytes)
-    def on_message(self, msg: bytes) -> None:
+    @Slot(int, bytes)
+    def on_message(self, pc: int, msg: bytes) -> None:
         kind = msg[0]
         if kind == link.CLIPBOARD and len(msg) > 1:
             self.clipboard.set_text(msg[1:].decode("utf-8", "replace"))
         elif kind == link.PONG and len(msg) == 5:
-            self.rtt = ((int(time.monotonic() * 1000) & 0xFFFFFFFF) - struct.unpack("<I", msg[1:])[0]) & 0xFFFFFFFF
+            self.sessions[pc].rtt = ((int(time.monotonic() * 1000) & 0xFFFFFFFF) -
+                                     struct.unpack("<I", msg[1:])[0]) & 0xFFFFFFFF
             self.changed.emit()
         elif self.cfg.role == "main":
-            if kind == link.LEAVE and len(msg) == 4:
-                if self.capture:
-                    self.capture.home(msg[2] | msg[3] << 8 if msg[1] else None, tell=False)
-                self.remote = False
-                self.changed.emit()
-            elif kind == link.AUDIO:
+            if kind == link.LEAVE and len(msg) in (4, 5) and pc == self.target:
+                self.cross_on(pc, msg[4] if len(msg) == 5 and msg[4] <= 3 else None,
+                              msg[2] | msg[3] << 8 if msg[1] else None)
+            elif kind == link.AUDIO and pc == self.sound_from():
                 self.player.play(msg)
             elif kind == link.AUDIO_STATE and len(msg) == 2:
-                self.audio_state = msg[1]
+                self.sessions[pc].audio_state = msg[1]
                 self.changed.emit()
-        else:
+        elif pc == 0:
             was = self.injector.active
             out = self.injector.replay(msg)
             if was and not self.injector.active:
-                self.send_clipboard()  # ahead of LEAVE, so it is there on arrival
+                self.send_clipboard(0)  # ahead of LEAVE, so it is there on arrival
             if out:
                 self._send(out)
             if was != self.injector.active:
@@ -190,39 +257,98 @@ class Controller(QObject):
         if self.discovery.expire():
             self.changed.emit()
 
-    # ---- actions ----
+    # ---- crossing between the PCs on the map (main PC) ----
 
-    def send_clipboard(self) -> None:
-        got = self.clipboard.changed()
+    def enter_peer(self, pc: int, edge: int, keep: bool, frac: int, relay: bool = False) -> None:
+        """Input goes to pc, moving in direction edge, at frac along the edge it comes in by (keep: the
+        pointer stays where it is over there). From any thread; the clipboard follows on the Qt thread,
+        and with `relay` what came from the PC before goes on too."""
+        s = self.sessions[pc]
+        msg = bytes([link.ENTER, edge, int(keep)]) + struct.pack("<H", frac) + bytes([self.exits(pc)])
+        s.send(msg if at_least(s.peer_version, (0, 3, 0)) else msg[:5])  # before 0.3: one way back only
+        self.target = self.last = pc
+        self.crossed.emit(pc, relay)
+        self.changed.emit()
+
+    def cross_from_here(self, edge: int, frac: int) -> bool:
+        """The capture thread: the pointer went through this PC's edge."""
+        to = self.cfg.neighbour(THIS_PC, edge)
+        if to == THIS_PC or not self.up(to):  # it went away meanwhile
+            return False
+        self.enter_peer(to, edge, False, frac)
+        return True
+
+    def cross_on(self, frm: int, edge, frac) -> None:
+        """The PC with input let it go through an edge (None: the way it came, from a Nexus before 0.3):
+        on to the PC past that edge, or home."""
+        if edge is None and self.edge_toward(frm) >= 0:
+            edge = self.edge_toward(frm) ^ 1
+        nxt = THIS_PC if edge is None else self.cfg.neighbour(frm, edge)
+        if nxt != THIS_PC and self.up(nxt):
+            self.enter_peer(nxt, edge, False, 32767 if frac is None else frac, relay=True)
+            return
+        if self.capture:
+            self.capture.home(edge ^ 1 if nxt == THIS_PC and edge is not None else None, frac)
+        self.target, self.remote = -1, False
+        self.changed.emit()
+
+    @Slot(int, bool)
+    def send_clipboard(self, pc: int, relay: bool = False) -> None:
+        got = self.clipboard.get() if relay else self.clipboard.changed()
         if not got:
             return
         kind, value = got
         if kind == "files":
-            if not self.files.send_paths(value, self.session.peer or "the other PC"):
+            if not self.files[pc].send_paths(value, self.name_of(pc)):
                 self.on_note("Still sending the last files; copy the new ones again once they are across.")
         else:
-            self._send(bytes([link.CLIPBOARD]) + value.encode("utf-8")[:link.MAX - 1])
+            self.sessions[pc].send(bytes([link.CLIPBOARD]) + value.encode("utf-8")[:link.MAX - 1])
 
-    def cross(self) -> None:
-        """Main PC: input goes over (the shortcut and the edge both end here)."""
-        if self.cfg.role == "main" and self.status == net.CONNECTED and not self.remote:
-            self.send_clipboard()
-            self._send(bytes([link.ENTER, EDGES.index(self.cfg.edge), 1, 0, 0]))
-            self.remote = True
-            self.changed.emit()
+    def cross(self, pc: int = -1) -> bool:
+        """Main PC: input goes to pc, else the PC used last (the shortcut and tests end here)."""
+        pc = pc if pc >= 0 else self.sound_from()
+        if self.cfg.role != "main" or not 0 <= pc < MAX_PEERS or not self.up(pc):
+            return False
+        if self.target >= 0:
+            self.home()
+        self.send_clipboard(pc)
+        edge = self.edge_toward(pc)
+        self.enter_peer(pc, edge if edge >= 0 else 1, True, 0)
+        self.remote = True
+        self.changed.emit()
+        return True
 
     def home(self) -> None:
         if self.cfg.role == "main" and self.remote:
             self._send(bytes([link.LEAVE, 0, 0, 0]))
-            self.remote = False
+            self.target, self.remote = -1, False
             self.changed.emit()
 
     def set_config(self, **values) -> None:
         for k, v in values.items():
             setattr(self.cfg, k, v)
         self.cfg.save()
-        self.session.restart()
+        for s in self.sessions:
+            s.restart()
         self.start_capture()
+        self.changed.emit()
+
+    def set_address(self, pc: int, addr: str) -> None:
+        """A controlled PC's address; empty removes it. A new one gets a free cell beside this PC."""
+        if addr == self.cfg.peers[pc]:
+            return
+        added = not self.cfg.peers[pc]
+        self.cfg.peers[pc] = addr
+        if added:
+            self.cfg.free_cell(pc)
+        self.cfg.save()
+        self.sessions[pc].peer = ""
+        self.sessions[pc].restart()
+        self.changed.emit()
+
+    def move_peer(self, pc: int, x: int, y: int) -> None:
+        if self.cfg.move(pc, x, y):
+            self.cfg.save()
         self.changed.emit()
 
     # ---- test mode ----
@@ -242,12 +368,19 @@ class Controller(QObject):
 
     def _answer(self, cmd: str) -> str:
         verb, _, arg = cmd.partition(" ")
-        if verb == "status":
+        if verb == "status":  # about the PC with input, else the one used last or the first one
+            pc = max(self.shown(), 0)
+            s = self.sessions[pc]
             return "role=%s status=%d peer=%s peer_version=%s remote=%d active=%d audio=%d version=%s files=%s" % (
-                self.cfg.role, self.status, self.session.peer, self.session.peer_version, self.remote,
-                self.injector.active, self.audio_state, VERSION, self.files_note)
+                self.cfg.role, self.status, s.peer, s.peer_version, self.remote, self.injector.active,
+                s.audio_state if self.cfg.role == "main" else self.audio_state, VERSION, self.files_note)
+        if verb == "peers":  # pc x,y status name, one per line
+            return "".join("%d %d,%d %d %s%s\n" % (i, *self.cfg.places[i], self.state[i], self.name_of(i),
+                                                   " *" if i == self.target else "")
+                           for i in range(MAX_PEERS) if self.cfg.peers[i])
         if verb == "cross":
-            self.cross()
+            if not self.cross(int(arg) if arg else -1):
+                return "not connected"
         elif verb == "home":
             self.home()
         elif verb == "move":
@@ -324,11 +457,98 @@ def page_icon(page: int, color: str, size: int = 24) -> QIcon:
 from PySide6.QtCore import QPointF  # noqa: E402  (used by page_icon)
 
 
+class Tile(QPushButton):
+    """A controlled PC on the map: dragged to another cell, or moved with the arrow keys."""
+
+    ARROWS = {Qt.Key_Left: (-1, 0), Qt.Key_Right: (1, 0), Qt.Key_Up: (0, -1), Qt.Key_Down: (0, 1)}
+
+    def __init__(self, view, pc: int):
+        super().__init__(view.c.name_of(pc), view)
+        self.view, self.pc, self._grab = view, pc, None
+        x, y = view.c.cfg.places[pc]
+        self.setAccessibleName("%s, on the map at %d, %d from this PC" % (view.c.name_of(pc), x, y))
+        self.setAccessibleDescription("Arrow keys move it to the next cell.")
+        self.setGeometry(view.cell_rect(x, y))
+
+    def _move_to(self, x: int, y: int) -> None:
+        self.setGeometry(self.view.cell_rect(*self.view.c.cfg.places[self.pc]))
+        # Later: the move rebuilds the page, and with it this button.
+        QTimer.singleShot(0, lambda: self.view.c.move_peer(self.pc, x, y))
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.LeftButton:
+            self.setFocus()
+            self.raise_()
+            self._grab = e.position().toPoint()
+
+    def mouseMoveEvent(self, e) -> None:
+        if self._grab is not None:
+            self.move(self.mapToParent(e.position().toPoint()) - self._grab)
+
+    def mouseReleaseEvent(self, e) -> None:
+        if self._grab is None or e.button() != Qt.LeftButton:
+            return
+        self._grab = None
+        mid, w, h = self.geometry().center(), self.view.cell_w, self.view.cell_h
+        if self.view.rect().contains(mid):  # dropped off the map: back to its cell
+            self._move_to(mid.x() // w - MAP_W // 2, mid.y() // h - MAP_H // 2)
+        else:
+            self._move_to(*self.view.c.cfg.places[self.pc])
+
+    def keyPressEvent(self, e) -> None:
+        step = self.ARROWS.get(e.key())
+        if not step:
+            return super().keyPressEvent(e)
+        x, y = self.view.c.cfg.places[self.pc]
+        self.view.win.focus_tile = self.pc
+        self._move_to(x + step[0], y + step[1])
+
+
+class MapView(QWidget):
+    """The Crossing page's map: this PC in the middle cell of a 5 x 3 grid, the others where they were put."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win, self.c = win, win.c
+        self.cell_w = max(70, min(150, (win.content.width() - 144) // MAP_W))
+        self.cell_h = self.cell_w * 3 // 5
+        self.setFixedSize(MAP_W * self.cell_w, MAP_H * self.cell_h)
+        for i in range(MAX_PEERS):
+            if self.c.cfg.peers[i]:
+                t = Tile(self, i)
+                if win.focus_tile == i:
+                    QTimer.singleShot(0, t.setFocus)
+        win.focus_tile = None
+
+    def cell_rect(self, x: int, y: int) -> QRect:
+        return QRect((x + MAP_W // 2) * self.cell_w + 4, (y + MAP_H // 2) * self.cell_h + 4,
+                     self.cell_w - 8, self.cell_h - 8)
+
+    def paintEvent(self, _e) -> None:
+        p, pal = QPainter(self), self.win.p
+        p.setRenderHint(QPainter.Antialiasing)
+        for cy in range(MAP_H):
+            for cx in range(MAP_W):
+                x, y = cx - MAP_W // 2, cy - MAP_H // 2
+                r = QRectF(self.cell_rect(x, y))
+                if (x, y) == (0, 0):
+                    p.setPen(QPen(QColor(pal["ink"]), 1.5))
+                    p.setBrush(QColor(pal["well"]))
+                    p.drawRoundedRect(r, 5, 5)
+                    p.drawText(r, Qt.AlignCenter, "This PC")
+                else:
+                    p.setPen(QPen(QColor(pal["rule"]), 1, Qt.DashLine))
+                    p.setBrush(Qt.NoBrush)
+                    p.drawRoundedRect(r, 5, 5)
+        p.end()
+
+
 class Window(QWidget):
     def __init__(self, c: Controller):
         super().__init__()
         self.c = c
         self.page = 0
+        self.focus_tile = None  # the map tile the arrow keys moved, focused again once rebuilt
         self.setWindowTitle("Nexus (test)" if c.test else "Nexus")
         self.setWindowIcon(QIcon(os.path.join(RES, "nexus.ico")))
         self.setMinimumSize(760, 640)
@@ -455,38 +675,47 @@ class Window(QWidget):
         self._shape = None
         self.refresh()
 
-    def _status_color(self) -> str:
-        s = self.c.status
+    def _status_color(self, s=None) -> str:
+        s = self.c.status if s is None else s
         return self.p["signal"] if s == net.CONNECTED else self.p["off"] if s <= net.CONNECTING else (
             self.p["amber"] if s == net.UNREACHABLE else self.p["fault"])
 
     def refresh(self) -> None:
         c, p = self.c, self.p
-        peer = c.session.peer or "the other PC"
+        pc = c.shown()
+        peer = c.name_of(pc)
         if c.status != net.CONNECTED:
             line, note = STATUS_WORD[c.status], STATUS_NOTE[c.status]
         elif c.remote:
-            line = "Input on %s" % peer
-            note = "Input is on %s. Push back through its edge, double-tap Right Ctrl, or press Ctrl+Alt+Pause " \
-                   "to return." % peer
+            line = "Input on %s" % c.name_of(c.target)
+            note = "Input is on %s. Push the pointer through an edge that leads on, double-tap Right Ctrl, or " \
+                   "press Ctrl+Alt+Pause to return." % c.name_of(c.target)
         elif c.cfg.role == "controlled" and c.injector.active:
             line, note = "Controlled by %s" % peer, "%s is driving this PC." % peer
-        else:
+        elif c.cfg.role == "main":
             line = "Connected"
-            note = ("Connected to %s. Push the pointer through the %s edge or double-tap Right Ctrl to cross."
-                    % (peer, c.cfg.edge)) if c.cfg.role == "main" else "Connected to %s, the main PC." % peer
+            n = sum(c.up(i) for i in range(MAX_PEERS))
+            note = ("Connected to %s." % peer if n == 1 else "Connected to %d PCs." % n) + \
+                " Push the pointer through an edge that has a PC beside it on the Crossing page to cross."
+        else:
+            line, note = "Connected", "Connected to %s, the main PC." % peer
         self.dot.setStyleSheet("background: %s; border-radius: 6px;" % self._status_color())
         self.line.setText(line)
-        who = c.session.peer if c.status == net.CONNECTED else (c.cfg.peer if c.cfg.role == "main" else "")
+        if c.cfg.role == "main":
+            who = peer if pc >= 0 else next((a for a in c.cfg.peers if a), "")
+        else:
+            who = peer if c.status == net.CONNECTED else ""
         self.who.setText(who or ("Main PC" if c.cfg.role == "main" else "Controlled PC"))
-        self.response.setText("Response: %s" % ("%d ms" % c.rtt if c.rtt is not None and c.status == net.CONNECTED
-                                                 else "—"))
+        rtt = c.sessions[pc].rtt if pc >= 0 else None
+        self.response.setText("Response: %s" % ("%d ms" % rtt if rtt is not None and c.up(pc) else "—"))
         for i, b in enumerate(self.navs):
             b.setChecked(i == self.page)
             b.setIcon(page_icon(i, p["ink"] if i == self.page else p["ink2"]))
         # Rebuilt only when what it shows changes: not for each response time, never under the typing hand.
-        shape = (self.page, note, c.cfg.role, c.cfg.edge, c.cfg.peer, bool(c.cfg.key), c.status, c.audio_state,
-                 c.files_note, tuple(sorted((ip, v[:2]) for ip, v in c.discovery.found.items())))
+        shape = (self.page, note, c.cfg.role, tuple(c.cfg.peers), tuple(c.cfg.places), bool(c.cfg.key),
+                 tuple(c.state), tuple(s.peer for s in c.sessions), tuple(s.audio_state for s in c.sessions),
+                 c.audio_state, c.sound_from(), c.files_note,
+                 tuple(sorted((ip, v[:2]) for ip, v in c.discovery.found.items())))
         focus = QApplication.focusWidget()
         if shape != getattr(self, "_shape", None) and not isinstance(focus, QLineEdit):
             self._shape = shape
@@ -518,29 +747,48 @@ class Window(QWidget):
                 b.clicked.connect(lambda: self.show_page(5))
                 m.addWidget(b, 0, Qt.AlignLeft)
             else:
-                m.addWidget(self._label(c.session.peer if c.status == net.CONNECTED and c.session.peer else
-                                        c.cfg.peer if main else "Main PC", "line"))
-                m.addWidget(self._label(("Controlled PC  ·  %s  ·  port %d" % (c.cfg.peer, c.port)) if main
-                                        else "Main PC  ·  connects to this PC on port %d" % c.port, "small"))
+                for i in range(MAX_PEERS):
+                    if main and not c.cfg.peers[i] or not main and i:
+                        continue
+                    row = QHBoxLayout()
+                    dot = QLabel()
+                    dot.setFixedSize(10, 10)
+                    dot.setStyleSheet("background: %s; border-radius: 5px;" % self._status_color(c.state[i]))
+                    row.addWidget(dot)
+                    row.addSpacing(12)
+                    row.addWidget(self._label(c.name_of(i) if main or c.up(i) else "Main PC", "line"), 1)
+                    m.addLayout(row)
+                    m.addWidget(self._label("Controlled PC  ·  %s  ·  %s" % (c.cfg.peers[i], STATUS_WORD[c.state[i]])
+                                            if main else "Main PC  ·  connects to this PC on port %d" % c.port,
+                                            "small"))
+                    m.addSpacing(8)
                 m.addWidget(self._label(note))
         elif self.page == 1:
-            if main:
-                m.addWidget(self._label("The controlled PC sits on this side of this screen:"))
-                row = QHBoxLayout()
-                for e in EDGES:
-                    b = QPushButton(e.capitalize(), checkable=True, checked=c.cfg.edge == e)
-                    b.setMinimumWidth(110)
-                    b.clicked.connect(lambda _=False, e=e: c.set_config(edge=e))
-                    row.addWidget(b)
-                row.addStretch(1)
-                m.addLayout(row)
-                m.addWidget(self._label("The pointer arrives at the same height on the other screen. Copied text "
-                                        "comes along when you cross.", "small"))
+            if not main:
+                m.addWidget(self._label("The main PC arranges the PCs. Push the pointer through an edge of this "
+                                        "screen that has a PC beside it on the main PC's map to go there."))
+            elif not any(c.cfg.peers):
+                m.addWidget(self._label("Add a controlled PC on the Connection page; it then shows up here."))
             else:
-                m.addWidget(self._label("The edge is chosen on the main PC. Push the pointer back through the edge "
-                                        "of this screen that faces it to return input there."))
+                m.addWidget(MapView(self), 0, Qt.AlignLeft)
+                m.addSpacing(8)
+                for i in range(MAX_PEERS):
+                    if not c.cfg.peers[i]:
+                        continue
+                    ways = self._ways_in(i)
+                    lab = self._label("%s: through %s." % (c.name_of(i), ways) if ways else
+                                      "%s: no edge leads there. Move it beside a PC, or double-tap Right Ctrl when "
+                                      "it is the PC used last." % c.name_of(i))
+                    if not ways:
+                        lab.setStyleSheet("color: %s;" % self.p["amber"])
+                    m.addWidget(lab)
+                m.addSpacing(8)
+                m.addWidget(self._label("Drag a PC to another cell, or select it and use the arrow keys. A PC "
+                                        "crosses to the one beside it and back the same way. The pointer arrives at "
+                                        "the same height, and what you copied comes along.", "small"))
         elif self.page == 2:
-            for keys, what in (("Right Ctrl  × 2", "Switch input to the other PC and back."),
+            for keys, what in (("Right Ctrl  × 2", "Switch input back to this PC." if main else
+                                "Switch input between the PCs."),
                                ("Ctrl + Alt + Pause", "Bring input back to this PC at once.")):
                 row = QHBoxLayout()
                 cap = self._label(keys, "keycap", wrap=False)
@@ -550,7 +798,8 @@ class Window(QWidget):
                 row.addSpacing(20)
                 row.addWidget(self._label(what), 1)
                 m.addLayout(row)
-            m.addWidget(self._label("Both work on this PC's keyboard, wherever input is." if main else
+            m.addWidget(self._label("Both work on this PC's keyboard while input is on another PC; to cross, push "
+                                    "the pointer through an edge." if main else
                                     "These are pressed on the main PC's keyboard.", "small"))
         elif self.page == 3:
             m.addWidget(self._label(self._sound_text()))
@@ -565,17 +814,28 @@ class Window(QWidget):
         lay.addWidget(module)
         lay.addStretch(1)
 
+    def _ways_in(self, pc: int) -> str:
+        """"this PC's right edge and XP's top edge": the edges that lead to pc on the map."""
+        c, ways = self.c, []
+        for e in range(4):
+            n = c.cfg.neighbour(pc, e)
+            if n >= 0:
+                ways.append("%s's %s edge" % ("this PC" if n == THIS_PC else c.name_of(n), EDGES[e ^ 1]))
+        return " and ".join(ways)
+
     def _sound_text(self) -> str:
         c, main = self.c, self.c.cfg.role == "main"
-        name = c.session.peer or "the other PC"
+        pc = c.sound_from() if main else 0
+        name = c.name_of(pc)
+        state = c.sessions[pc].audio_state if main and pc >= 0 else c.audio_state
         if c.status != net.CONNECTED:
             return ("Connect a controlled PC first; its sound then plays here." if main else
                     "Once the main PC connects, this PC's sound plays on its speakers.")
-        if c.audio_state in (sound.LOOPBACK, sound.STEREO_MIX):
-            return ("%s's sound plays on this PC's speakers. Its own speakers keep playing too; turn them down "
-                    "there if you only want to hear it here." % name) if main else \
+        if state in (sound.LOOPBACK, sound.STEREO_MIX):
+            return ("%s's sound plays on this PC's speakers: the sound of the PC used last. Its own speakers keep "
+                    "playing too; turn them down there if you only want to hear it here." % name) if main else \
                 "This PC's sound plays on %s's speakers." % name
-        if c.audio_state == sound.NONE:
+        if state == sound.NONE:
             return "%s cannot record what its speakers play." % (name if main else "This PC")
         return "Waiting for %s to report its sound." % (name if main else "this PC")
 
@@ -589,7 +849,7 @@ class Window(QWidget):
             row.addWidget(b)
         row.addStretch(1)
         m.addLayout(row)
-        m.addWidget(self._label("The main PC has the keyboard and mouse, and plays the other PC's sound." if main
+        m.addWidget(self._label("The main PC has the keyboard and mouse, and plays the other PCs' sound." if main
                                 else "The controlled PC is driven by the main PC's keyboard and mouse.", "small"))
         m.addSpacing(16)
         m.addWidget(self._label("Shared password", "line"))
@@ -603,21 +863,34 @@ class Window(QWidget):
         pw.returnPressed.connect(set_password)
         m.addWidget(pw)
         m.addWidget(self._label("Set. Type a new one and press Enter to change it." if c.cfg.key else
-                                "Type the same password on both PCs and press Enter.", "small"))
+                                "Type the same password on all PCs and press Enter.", "small"))
         if main:
             m.addSpacing(16)
-            m.addWidget(self._label("Controlled PC's address", "line"))
-            peer = QLineEdit(c.cfg.peer, maximumWidth=380)
-            peer.setAccessibleName("Controlled PC's address")
-            peer.returnPressed.connect(lambda: c.set_config(peer=peer.text().strip()))
-            m.addWidget(peer)
-            m.addWidget(self._label("The controlled PC shows its address on its own Connection page.", "small"))
-            found = [(ip, n) for ip, (n, r, _s) in c.discovery.found.items() if r == 1]
-            if found:
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(16)
+            for i in range(MAX_PEERS):
+                cell = QVBoxLayout()
+                cell.addWidget(self._label("Controlled PC %d" % (i + 1), "line"))
+                peer = QLineEdit(c.cfg.peers[i], maximumWidth=380)
+                peer.setAccessibleName("Controlled PC %d's address" % (i + 1))
+
+                def set_address(peer=peer, i=i):
+                    addr = peer.text().strip()
+                    if all(ch.isalnum() or ch in ".-" for ch in addr):  # only what a host name or address holds
+                        c.set_address(i, addr)
+                peer.returnPressed.connect(set_address)
+                cell.addWidget(peer)
+                grid.addLayout(cell, i // 2, i % 2)
+            m.addLayout(grid)
+            m.addWidget(self._label("Each controlled PC shows its address on its own Connection page. Clear an "
+                                    "address to remove that PC.", "small"))
+            found = [(ip, n) for ip, (n, r, _s) in c.discovery.found.items() if r == 1 and ip not in c.cfg.peers]
+            free = next((i for i in range(MAX_PEERS) if not c.cfg.peers[i]), -1)
+            if found and free >= 0:
                 m.addWidget(self._label("Found on this network:", "small"))
                 for ip, n in found:
                     b = QPushButton("%s  ·  %s" % (n, ip), objectName="link")
-                    b.clicked.connect(lambda _=False, ip=ip: c.set_config(peer=ip))
+                    b.clicked.connect(lambda _=False, ip=ip: c.set_address(free, ip))
                     m.addWidget(b, 0, Qt.AlignLeft)
         m.addSpacing(16)
         m.addWidget(self._label("This PC's address: %s  ·  port %d" % (local_addresses(), c.port)))

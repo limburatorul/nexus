@@ -15,12 +15,14 @@ SETUP, WAITING, CONNECTING, UNREACHABLE, PASSWORD, VERSION, ROLE, PEER, PORT, CO
 
 
 class Session:
-    def __init__(self, config, name: str, version: str, port: int, on_status, on_message, files=None):
-        self.config, self.name, self.version, self.port = config, name, version, port
+    def __init__(self, config, name: str, version: str, port: int, on_status, on_message, files=None, index=0):
+        """index: which of the main PC's controlled PCs (peer..peer4); a controlled PC uses 0 only."""
+        self.config, self.name, self.version, self.port, self.index = config, name, version, port, index
         self.on_status, self.on_message, self.files = on_status, on_message, files
         self.link = None
         self.peer = ""
         self.peer_version = ""
+        self.rtt, self.audio_state = None, 0  # the Qt thread's, about this peer
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._gen = 0
@@ -29,8 +31,8 @@ class Session:
         self.status = SETUP
 
     def start(self) -> None:
-        threading.Thread(target=self._run, daemon=True, name="nexus-net").start()
-        threading.Thread(target=self._ping, daemon=True, name="nexus-ping").start()
+        threading.Thread(target=self._run, daemon=True, name="nexus-net%d" % self.index).start()
+        threading.Thread(target=self._ping, daemon=True, name="nexus-ping%d" % self.index).start()
 
     def restart(self) -> None:
         """Drop the connection and read the config again (after the user changed it)."""
@@ -93,7 +95,8 @@ class Session:
                 cfg = self.config
                 if gen != self._gen:
                     gen, sticky = self._gen, 0
-            if not cfg.ready:
+            addr = cfg.peers[self.index] if cfg.role == "main" else ""
+            if not cfg.key or (addr == "" if cfg.role == "main" else self.index):
                 self._set_status(SETUP)
                 self._wait(3600)
                 continue
@@ -104,7 +107,7 @@ class Session:
                         self._listener = None
                 self._set_status(sticky or CONNECTING)
                 try:
-                    sock = socket.create_connection((cfg.peer, self.port), timeout=3)
+                    sock = socket.create_connection((addr, self.port), timeout=3)
                 except OSError:
                     sticky = UNREACHABLE
                     self._set_status(sticky)

@@ -1,6 +1,6 @@
 """The main PC's side on Wayland: the InputCapture portal (Beamer's capture_portal) holds this PC's
-pointer and keys once the pointer meets the edge facing the controlled PC, and Nexus sends them
-there. Crossing is immediate, as on Windows. While input is away, a double tap of Right Ctrl or
+pointer and keys once the pointer meets an edge with a connected PC past it on the map, and Nexus
+sends them there. Crossing is immediate, as on Windows. While input is away, a double tap of Right Ctrl or
 Ctrl+Alt+Pause brings it home.
 """
 
@@ -12,6 +12,7 @@ import desktop_portal
 from core.return_edge import ReturnEdge
 
 from . import keymap, link, wayland
+from .config import EDGES, THIS_PC
 
 WM = {0x201: (1, 1), 0x202: (1, 0), 0x204: (2, 1), 0x205: (2, 0), 0x207: (3, 1), 0x208: (3, 0)}
 WM_XBUTTONDOWN, WM_XBUTTONUP, WM_MOUSEWHEEL, WM_MOUSEHWHEEL = 0x20B, 0x20C, 0x20A, 0x20E
@@ -21,13 +22,13 @@ TAP_SECONDS = 0.4
 
 class Capture:
     def __init__(self, controller):
-        """controller: .cfg, .status, .remote (read and set here), .send(msg), .crossed (a Qt signal
-        for the clipboard, which belongs to the Qt thread)."""
+        """controller: .cfg, .up(pc), .remote and .target (read and set here), .send(msg) to the PC
+        with input, .cross_from_here(edge, frac)."""
         self.c = controller
         self.hooks = capture_portal.Hooks(self.on_key, self.on_mouse, self.on_motion)
         self.hooks.grab_while(lambda: self.c.remote)
         self.hooks.barriers_from(self.models)
-        self.hooks.on_home = lambda: self.home(None, tell=True)
+        self.hooks.on_home = lambda: self.home(None, None, tell=True)
         self._models = {}
         self._back = None  # where the pointer was when it crossed
         self._down = set()
@@ -38,14 +39,16 @@ class Capture:
         self.hooks.start()
 
     def models(self):
-        """The edge the controlled PC is on, while one is connected and input is here."""
-        from .net import CONNECTED
-        if self.c.status != CONNECTED or self.c.remote or self.c.cfg.role != "main":
+        """The edges with a connected PC past them, while input is here."""
+        if self.c.remote or self.c.cfg.role != "main":
             return []
-        edge = self.c.cfg.edge
-        if edge not in self._models:
-            self._models[edge] = ReturnEdge(edge, resistance_px=0)
-        return [self._models[edge]]
+        out = []
+        for e, edge in enumerate(EDGES):
+            if self.c.up(self.c.cfg.neighbour(THIS_PC, e)):
+                if edge not in self._models:
+                    self._models[edge] = ReturnEdge(edge, resistance_px=0)
+                out.append(self._models[edge])
+        return out
 
     def push(self) -> bool:
         """Tests: push the pointer through the edge with injected motion, as Beamer's shortcut does."""
@@ -54,13 +57,15 @@ class Capture:
     # ---- the capture thread's callbacks ----
 
     def _cross(self) -> None:
+        wall = self.hooks._last_wall  # the barrier the desktop caught the pointer at
+        if wall not in EDGES:
+            return
+        edge = EDGES.index(wall)
         b = wayland.bounds()
         x, y = desktop_portal.cursor_position()
-        edge = ("left", "right", "top", "bottom").index(self.c.cfg.edge)
         self._back = (x, y)
-        self.c.remote = True
-        self.c.send(bytes([link.ENTER, edge, 0]) + struct.pack("<H", wayland.along(b, x, y, edge)))
-        self.c.crossed.emit()
+        if self.c.cross_from_here(edge, wayland.along(b, x, y, edge)):
+            self.c.remote = True
 
     def on_motion(self, dx: int, dy: int) -> None:
         if not self.c.remote:
@@ -95,26 +100,28 @@ class Capture:
                 now = time.monotonic()
                 if self._tap_clean and now - self._last_tap < TAP_SECONDS:
                     self._tap_clean = False
-                    return self.home(None, tell=True)
+                    return self.home(None, None, tell=True)
                 self._tap_clean, self._last_tap = True, now
             else:
                 self._tap_clean = False
             if code == PAUSE and self._down & {L_CTRL, R_CTRL} and self._down & {L_ALT, R_ALT}:
-                return self.home(None, tell=True)
+                return self.home(None, None, tell=True)
         win = keymap.to_windows(code)
         if win:
             vk, scan, ext = win
             self.c.send(bytes([link.KEY, vk, scan, (0 if down else 1) | (2 if ext else 0)]))
 
-    def home(self, frac, tell: bool) -> None:
-        """Input comes back: at `frac` along our edge when the controlled PC handed it back, else
-        where it left. `tell`: the controlled PC does not know yet."""
+    def home(self, edge, frac, tell: bool = False) -> None:
+        """Input comes back: at `frac` along this PC's `edge` when a controlled PC handed it back
+        through it, else where it left. `tell`: the PC with input does not know yet."""
         if not self.c.remote:
             return
         if tell:
             self.c.send(bytes([link.LEAVE, 0, 0, 0]))
-        edge = ("left", "right", "top", "bottom").index(self.c.cfg.edge)
-        point = wayland.on_edge(wayland.bounds(), edge, frac) if frac is not None else self._back
+        self.c.target = -1
+        point = self._back
+        if edge is not None:
+            point = wayland.on_edge(wayland.bounds(), edge, 32767 if frac is None else frac)
         if point:
             desktop_portal.set_cursor_position(*point)  # where the capture lets go
         self._down.clear()

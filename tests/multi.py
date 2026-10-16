@@ -1,8 +1,9 @@
 """Drives a main PC with three controlled PCs on its map: B right of this PC, C right of B, D left of it.
 
-    python tests/multi.py <main IP> <B IP> <C IP> <D IP>
+    python tests/multi.py <main IP> <B IP> <C IP> [<D IP>]
 
-The main PC's test.ini lists B, C and D as peer, peer2 and peer3 at places 1,0, 2,0 and -1,0. The pointer
+The main PC's test.ini lists B, C and D as peer, peer2 and peer3 at places 1,0, 2,0 and -1,0 (without D,
+B and C only). The pointer
 crosses into B, on through B's right edge into C, back through C's left edge into B, home through B's
 left edge, and then into D; text copied on C comes back along the chain.
 """
@@ -31,9 +32,9 @@ def target(main):
     return -1
 
 
-def run(main_host, b_host, c_host, d_host):
-    main, b, c, d = Machine(main_host), Machine(b_host), Machine(c_host), Machine(d_host)
-    until("all connected", lambda: main("peers").count(" 9 ") == 3, 30)
+def run(main_host, b_host, c_host, d_host=None):
+    main, b, c = Machine(main_host), Machine(b_host), Machine(c_host)
+    until("all connected", lambda: main("peers").count(" 9 ") == (3 if d_host else 2), 30)
     tag = secrets.token_hex(3)
 
     main("cross 0")
@@ -58,6 +59,10 @@ def run(main_host, b_host, c_host, d_host):
     assert main("clip-get") == "text:" + text, main("clip-get")
     print("ok  B -> this PC through B's left edge, text here too")
 
+    if not d_host:
+        print("all passed (no D)")
+        return
+    d = Machine(d_host)
     main("cross 2")
     until("input on D", lambda: "active=1" in d("status"), 5)
     assert push(main, d, 400), "D never let go through its right edge"

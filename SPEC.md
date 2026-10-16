@@ -106,12 +106,15 @@ iar la final `FILE_END 16`. Părinții vin înaintea conținutului. Receptorul s
    pe pagina Connection apar PC-urile controlate găsite, un click completează adresa. Nimic din răspuns nu e secret.
 8. **Linux** (Python + PySide6, `linux/nexus`), refolosind back-end-urile Wayland din Beamer (`linux/beamer`):
    - controlat: injectare și clipboard prin portalul RemoteDesktop (cere permisiunea o dată, apoi token);
-   - principal: captură prin portalul InputCapture (KDE 6.6 are doar v1, fără token: **cere permisiunea la fiecare pornire**);
+   - principal: captură prin portalul InputCapture (KDE 6.6 are doar v1, fără token: **cere permisiunea la fiecare pornire**),
+     cu bariere pe fiecare margine care duce la un PC conectat de pe hartă; aceeași rutare ca pe Windows;
    - sunet prin `parec`/`pacat` (PipeWire sau PulseAudio), fișierele copiate ca `text/uri-list`;
    - aceeași fereastră, aceleași pagini și același mod de test ca pe Windows. **X11 netestat.**
 9. **Teste automate** (`tests/driver.py`): `nexus /test` (Windows) și `python -m nexus --test` (Linux) rulează un
    profil separat (`test.ini`, port 24810, fără cârlige) și primesc comenzi pe 24811, autentificate cu cheia legăturii.
    Driverul verifică text ↔, cursor și fișiere ↔ între oricare două PC-uri. Trec: Win11 → XP, Win11 → Kubuntu, Kubuntu → XP.
+   `tests/multi.py` verifică lanțul pe hartă (principal → B → C → B → principal, cu clipboardul pe drum): trece cu
+   Kubuntu principal, XP la dreapta lui și Manjaro la dreapta lui XP.
 10. **M6** Extra din Multiplicity, doar dacă le vrei: mai multe PC-uri controlate, blocare/screensaver
    sincronizat, controlat → principal în ambele sensuri.
 
