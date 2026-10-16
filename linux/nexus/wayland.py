@@ -28,20 +28,31 @@ def bounds():
             max(s.x + s.width - 1 for s in screens), max(s.y + s.height - 1 for s in screens))
 
 
-def along(b, x, y, edge) -> int:
-    """Position along an edge, 0..65535, as the Windows side counts it."""
+def span(screens, b, edge):
+    """The stretch (lo, hi, inclusive) of a desktop edge that screens touch. With a 4K and a 1080p screen
+    side by side, 60% of the way down the 1080p one is 60% of that screen, not of the desktop's height."""
     left, top, right, bottom = b
+    touches = {LEFT: lambda s: s.x == left, RIGHT: lambda s: s.x + s.width - 1 == right,
+               TOP: lambda s: s.y == top, BOTTOM: lambda s: s.y + s.height - 1 == bottom}[edge]
+    at = [s for s in screens if touches(s)]
     if edge in (LEFT, RIGHT):
-        return (y - top) * 65535 // max(1, bottom - top)
-    return (x - left) * 65535 // max(1, right - left)
+        return (min(s.y for s in at), max(s.y + s.height - 1 for s in at)) if at else (top, bottom)
+    return (min(s.x for s in at), max(s.x + s.width - 1 for s in at)) if at else (left, right)
+
+
+def along(b, x, y, edge) -> int:
+    """Position along the screens at an edge, 0..65535, as the Windows side counts it: 60% of the way
+    down here arrives 60% of the way down there, whatever the two screens' sizes."""
+    lo, hi = span(desktop_portal.monitors(), b, edge)
+    return max(0, min(65535, ((y if edge in (LEFT, RIGHT) else x) - lo) * 65535 // max(1, hi - lo)))
 
 
 def on_edge(b, edge, frac):
-    """A point just inside an edge."""
+    """A point just inside an edge, at a position along the screens there."""
     left, top, right, bottom = b
-    x = left + frac * (right - left) // 65535
-    y = top + frac * (bottom - top) // 65535
-    return {LEFT: (left + 2, y), RIGHT: (right - 2, y), TOP: (x, top + 2), BOTTOM: (x, bottom - 2)}[edge]
+    lo, hi = span(desktop_portal.monitors(), b, edge)
+    at = lo + frac * (hi - lo) // 65535
+    return {LEFT: (left + 2, at), RIGHT: (right - 2, at), TOP: (at, top + 2), BOTTOM: (at, bottom - 2)}[edge]
 
 
 class Injector:

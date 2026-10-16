@@ -21,23 +21,63 @@ static RECT vscreen(void)
     return v;
 }
 
-/* Position along an edge, 0..65535, so screens of different sizes line up proportionally. */
-static int along(RECT v, POINT p, int edge)
+/* The stretch lo..hi of a desktop edge that screens touch. With a 4K and a 1080p screen side by side,
+ * 60% of the way down the 1080p one is 60% of that screen, not of the desktop's full height.
+ * ponytail: screens stacked along an edge with a gap between them map across the gap too */
+static void span_of(const RECT *screen, int n, RECT v, int edge, int *lo, int *hi)
 {
-    if (edge == EDGE_LEFT || edge == EDGE_RIGHT) return MulDiv(p.y - v.top, 65535, v.bottom - v.top - 1);
-    return MulDiv(p.x - v.left, 65535, v.right - v.left - 1);
+    BOOL vertical = edge == EDGE_LEFT || edge == EDGE_RIGHT;
+    *lo = vertical ? v.bottom : v.right, *hi = vertical ? v.top : v.left;
+    for (int i = 0; i < n; i++) {
+        const RECT *r = &screen[i];
+        BOOL touches = edge == EDGE_LEFT ? r->left == v.left : edge == EDGE_RIGHT ? r->right == v.right
+                     : edge == EDGE_TOP ? r->top == v.top : r->bottom == v.bottom;
+        if (!touches) continue;
+        *lo = min(*lo, vertical ? r->top : r->left);
+        *hi = max(*hi, vertical ? r->bottom : r->right);
+    }
+    if (*lo >= *hi) *lo = vertical ? v.top : v.left, *hi = vertical ? v.bottom : v.right;
 }
 
-/* A point just inside an edge, at a position along it. */
+typedef struct { RECT r[16]; int n; } Screens;
+
+static BOOL CALLBACK add_screen(HMONITOR m, HDC dc, LPRECT r, LPARAM s)
+{
+    (void)m, (void)dc;
+    Screens *all = (Screens *)s;
+    if (all->n < 16) all->r[all->n++] = *r;
+    return TRUE;
+}
+
+static void edge_span(RECT v, int edge, int *lo, int *hi)
+{
+    Screens s = {0};
+    EnumDisplayMonitors(NULL, NULL, add_screen, (LPARAM)&s);
+    span_of(s.r, s.n, v, edge, lo, hi);
+}
+
+/* Position along an edge, 0..65535, of the screens at that edge, so screens of different sizes line up
+ * proportionally: 60% of the way down here arrives 60% of the way down there. */
+static int along(RECT v, POINT p, int edge)
+{
+    int lo, hi;
+    edge_span(v, edge, &lo, &hi);
+    int at = edge == EDGE_LEFT || edge == EDGE_RIGHT ? p.y : p.x;
+    return max(0, min(65535, MulDiv(at - lo, 65535, hi - lo - 1)));
+}
+
+/* A point just inside an edge, at a position along the screens there. */
 static POINT on_edge(RECT v, int edge, int frac)
 {
     POINT p;
-    int x = v.left + MulDiv(frac, v.right - v.left - 1, 65535), y = v.top + MulDiv(frac, v.bottom - v.top - 1, 65535);
+    int lo, hi;
+    edge_span(v, edge, &lo, &hi);
+    int at = lo + MulDiv(frac, hi - lo - 1, 65535);
     switch (edge) {
-    case EDGE_LEFT: p.x = v.left + 2, p.y = y; break;
-    case EDGE_RIGHT: p.x = v.right - 3, p.y = y; break;
-    case EDGE_TOP: p.x = x, p.y = v.top + 2; break;
-    default: p.x = x, p.y = v.bottom - 3;
+    case EDGE_LEFT: p.x = v.left + 2, p.y = at; break;
+    case EDGE_RIGHT: p.x = v.right - 3, p.y = at; break;
+    case EDGE_TOP: p.x = at, p.y = v.top + 2; break;
+    default: p.x = at, p.y = v.bottom - 3;
     }
     return p;
 }
@@ -333,8 +373,13 @@ int input_replay(const unsigned char *msg, int len, unsigned char leave[8])
                 leave[0] = MSG_LEAVE, leave[1] = 1, leave[2] = (BYTE)f, leave[3] = (BYTE)(f >> 8), leave[4] = (BYTE)e;
                 return c.tell_edge ? 5 : 4;
             }
-        c.pos.x = max(v.left, min(v.right - 1, c.pos.x + dx));
-        c.pos.y = max(v.top, min(v.bottom - 1, c.pos.y + dy));
+        c.pos.x += dx, c.pos.y += dy;
+        /* Kept on a screen, as Windows keeps the pointer: beside a smaller screen there is no desktop. */
+        MONITORINFO mi = {0};
+        mi.cbSize = sizeof mi;
+        GetMonitorInfoW(MonitorFromPoint(c.pos, MONITOR_DEFAULTTONEAREST), &mi);
+        c.pos.x = max(mi.rcMonitor.left, min(mi.rcMonitor.right - 1, c.pos.x));
+        c.pos.y = max(mi.rcMonitor.top, min(mi.rcMonitor.bottom - 1, c.pos.y));
         INPUT in = {0};
         in.type = INPUT_MOUSE;
         /* Aim at the pixel's centre: Windows rounds the 0..65535 position down when mapping it back. */

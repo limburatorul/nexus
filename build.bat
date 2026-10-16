@@ -24,6 +24,8 @@ gcc %CFLAGS% -Wall -Wextra -municode -mwindows src\nexus.c src\link.c src\input.
 
 gcc %CFLAGS% -Wall -Wextra tests\link_test.c src\link.c build\tweetnacl.o -o build\link_test.exe %LIBS% || exit /b 1
 build\link_test.exe || exit /b 1
+gcc %CFLAGS% -Wall -Wextra tests\edge_test.c -o build\edge_test.exe %LIBS% || exit /b 1
+build\edge_test.exe || exit /b 1
 
 python tools\check_xp_imports.py build\nexus.exe || exit /b 1
 
