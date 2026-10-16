@@ -1203,8 +1203,8 @@ static void layout(void)
     case PAGE_FILES:
         y = add_text(mx, y, mw,
                      L"Copy files or folders in Explorer, cross to another PC and press Ctrl+V. They travel when "
-                     L"you cross and land in a dated folder under Nexus Received on its desktop, up to 1 GB at "
-                     L"a time.",
+                     L"you cross and land in a dated folder under Nexus Received on its desktop, whatever their "
+                     L"size.",
                      g.body, C_INK2);
         if (g.files_note[0]) y = add_text(mx, y + S(16), mw, g.files_note, g.body, C_INK);
         break;

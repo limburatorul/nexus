@@ -267,3 +267,4 @@ user32.dll!setcapture
 user32.dll!enumdisplaymonitors
 user32.dll!getmonitorinfow
 user32.dll!monitorfrompoint
+kernel32.dll!getdiskfreespaceexw

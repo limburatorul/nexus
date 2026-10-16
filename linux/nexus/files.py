@@ -4,13 +4,13 @@ Received items land in <Desktop>/Nexus Received/<date time>/ and go on the clipb
 """
 
 import os
+import shutil
 import struct
 import threading
 import time
 
 from . import link
 
-MAX_BYTES = 1024 * 1024 * 1024  # a bigger copy stays put: likely a slip, and slow
 CHUNK = 32768
 
 
@@ -28,7 +28,9 @@ def desktop_dir() -> str:
 
 
 def size_text(n: int) -> str:
-    return "%d KB" % ((n + 1023) // 1024) if n < 1048576 else "%.1f MB" % (n / 1048576)
+    if n < 1048576:
+        return "%d KB" % ((n + 1023) // 1024)
+    return "%.1f MB" % (n / 1048576) if n < 1 << 30 else "%.1f GB" % (n / (1 << 30))
 
 
 def safe_parts(rel: str):
@@ -75,10 +77,6 @@ class Files:
         try:
             items = list(self._items(paths))
             total = sum(os.path.getsize(p) for p, _, d in items if not d)
-            if total > MAX_BYTES:
-                self.on_note("The copied files are %s, over the 1 GB Nexus carries at once, so they stayed "
-                             "on this PC." % size_text(total))
-                return
             count = len(items)
             plural = "" if count == 1 else "s"
             self.on_note("Sending %d item%s (%s) to %s…" % (count, plural, size_text(total), peer))
@@ -141,10 +139,13 @@ class Files:
             return
         self.abort()
         count, total = struct.unpack("<IQ", msg[1:])
-        if total > MAX_BYTES:
-            return
         base = os.path.join(desktop_dir(), "Nexus Received")
         os.makedirs(base, exist_ok=True)
+        free = shutil.disk_usage(base).free
+        if total > free:  # no size limit, only the disk's: refused before it fills the disk
+            self.on_note("The copied files are %s and this PC's disk has %s free, so they were not received."
+                         % (size_text(total), size_text(free)))
+            return
         stamp = time.strftime("%Y-%m-%d %H-%M-%S")
         folder = os.path.join(base, stamp)
         for i in range(2, 10):  # two batches within one second

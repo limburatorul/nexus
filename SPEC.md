@@ -83,7 +83,7 @@ iar la final `FILE_END 16`. Părinții vin înaintea conținutului. Receptorul s
 **Ctrl+V** le lipește unde vrei.
 - Căile primite sunt validate: doar nume simple, nimic absolut, fără `..` și fără caractere interzise; orice
   abatere anulează lotul, iar un folder rămas gol se șterge.
-- Peste 1 GB per copiere nu se trimite nimic (probabil o greșeală). Joncțiunile nu sunt urmate. Un fișier
+- Nu există limită de mărime; receptorul refuză doar un lot care nu încape pe discul lui. Joncțiunile nu sunt urmate. Un fișier
   blocat e sărit. Cât timp un transfer e în curs, o nouă copiere rămâne pe loc.
 
 ## Etape (fiecare se testează înainte de următoarea)

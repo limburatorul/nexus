@@ -31,7 +31,8 @@ static void note(const wchar_t *fmt, ...)
 static void size_text(wchar_t out[32], LONGLONG b)
 {
     if (b < 1024 * 1024) _snwprintf(out, 32, L"%d KB", (int)((b + 1023) / 1024));
-    else _snwprintf(out, 32, L"%d.%d MB", (int)(b / 1048576), (int)(b % 1048576 * 10 / 1048576));
+    else if (b < 1024LL * 1048576) _snwprintf(out, 32, L"%d.%d MB", (int)(b / 1048576), (int)(b % 1048576 * 10 / 1048576));
+    else _snwprintf(out, 32, L"%d.%d GB", (int)(b >> 30), (int)((b & ((1LL << 30) - 1)) * 10 >> 30));
     out[31] = 0;
 }
 
@@ -118,23 +119,19 @@ static DWORD WINAPI send_thread(void *p)
     for (int i = 0; i < b->n; i++) walk(b, b->paths[i], 0, count);
     wchar_t size[32];
     size_text(size, b->total);
-    if (b->total > FILES_MAX_BYTES) {
-        note(L"The copied files are %ls, over the 1 GB Nexus carries at once, so they stayed on this PC.", size);
-    } else {
-        unsigned char begin[13] = {MSG_FILE_BEGIN};
-        for (int i = 0; i < 4; i++) begin[1 + i] = (unsigned char)(b->count >> (8 * i));
-        put64(begin + 5, b->total);
-        note(L"Sending %d item%ls (%ls) to %ls\x2026", b->count, b->count == 1 ? L"" : L"s", size, b->peer);
-        b->ok = link_out(b->to, begin, 13);
-        for (int i = 0; i < b->n && b->ok; i++) {
-            const wchar_t *slash = wcsrchr(b->paths[i], L'\\');
-            walk(b, b->paths[i], slash ? (int)(slash - b->paths[i]) + 1 : 0, send_item);
-        }
-        unsigned char end = MSG_FILE_END;
-        if (b->ok) b->ok = link_out(b->to, &end, 1);
-        if (b->ok) note(L"Sent %d item%ls (%ls) to %ls.", b->count, b->count == 1 ? L"" : L"s", size, b->peer);
-        else note(L"Sending to %ls stopped part way; copy the files again to retry.", b->peer);
+    unsigned char begin[13] = {MSG_FILE_BEGIN};
+    for (int i = 0; i < 4; i++) begin[1 + i] = (unsigned char)(b->count >> (8 * i));
+    put64(begin + 5, b->total);
+    note(L"Sending %d item%ls (%ls) to %ls\x2026", b->count, b->count == 1 ? L"" : L"s", size, b->peer);
+    b->ok = link_out(b->to, begin, 13);
+    for (int i = 0; i < b->n && b->ok; i++) {
+        const wchar_t *slash = wcsrchr(b->paths[i], L'\\');
+        walk(b, b->paths[i], slash ? (int)(slash - b->paths[i]) + 1 : 0, send_item);
     }
+    unsigned char end = MSG_FILE_END;
+    if (b->ok) b->ok = link_out(b->to, &end, 1);
+    if (b->ok) note(L"Sent %d item%ls (%ls) to %ls.", b->count, b->count == 1 ? L"" : L"s", size, b->peer);
+    else note(L"Sending to %ls stopped part way; copy the files again to retry.", b->peer);
     for (int i = 0; i < b->n; i++) free(b->paths[i]);
     free(b->paths);
     free(b);
@@ -220,11 +217,20 @@ static void begin(const unsigned char *m, int len)
     files_abort();
     rx.count = (int)(m[1] | m[2] << 8 | m[3] << 16 | (DWORD)m[4] << 24);
     rx.total = get64(m + 5);
-    if (rx.total < 0 || rx.total > FILES_MAX_BYTES) return;
+    if (rx.total < 0) return;
     SYSTEMTIME t;
     GetLocalTime(&t);
-    wchar_t desk[MAX_PATH];
+    wchar_t desk[MAX_PATH], size[32], room[32];
     if (SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, desk) != S_OK) return;
+    ULARGE_INTEGER free_bytes;
+    /* No size limit, only the disk's: a copy that cannot fit is refused before it fills the disk.
+     * ponytail: the sender is not told and keeps sending what this PC drops; tell it if that matters */
+    if (GetDiskFreeSpaceExW(desk, &free_bytes, NULL, NULL) && (ULONGLONG)rx.total > free_bytes.QuadPart) {
+        size_text(size, rx.total);
+        size_text(room, (LONGLONG)free_bytes.QuadPart);
+        note(L"The copied files are %ls and this PC's disk has %ls free, so they were not received.", size, room);
+        return;
+    }
     _snwprintf(rx.dir, MAX_PATH, L"%ls\\Nexus Received", desk);
     CreateDirectoryW(rx.dir, NULL);
     _snwprintf(rx.dir, MAX_PATH, L"%ls\\Nexus Received\\%04d-%02d-%02d %02d-%02d-%02d", desk, t.wYear, t.wMonth,
@@ -242,7 +248,6 @@ static void begin(const unsigned char *m, int len)
     rx.last_pct = -10;
     rx.tops = calloc(1, sizeof(wchar_t));
     rx.tops_len = 0;
-    wchar_t size[32];
     size_text(size, rx.total);
     note(L"Receiving %d item%ls (%ls)\x2026", rx.count, rx.count == 1 ? L"" : L"s", size);
 }

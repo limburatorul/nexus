@@ -806,7 +806,7 @@ class Window(QWidget):
         elif self.page == 4:
             m.addWidget(self._label("Copy files or folders in your file manager, cross to the other PC and press "
                                     "Ctrl+V. They travel when you cross and land in a dated folder under Nexus "
-                                    "Received on its desktop, up to 1 GB at a time."))
+                                    "Received on its desktop, whatever their size."))
             if c.files_note:
                 m.addWidget(self._label(c.files_note, "line"))
         else:
