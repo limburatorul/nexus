@@ -16,7 +16,7 @@ rem 0x0501 hides post-XP APIs in the headers; the subsystem version lets XP's lo
 set DEFS=-DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -D_WIN32_IE=0x0600 -Ibuild
 windres -I src -I build src\nexus.rc -O coff -o build\nexus.res || exit /b 1
 set CFLAGS=-std=gnu11 -Os -march=i686 -mtune=generic -static %DEFS%
-set LIBS=-lws2_32 -lgdi32 -luser32 -lshell32 -ladvapi32 -lwinmm -lole32 -lwinhttp
+set LIBS=-lws2_32 -lgdi32 -luser32 -lshell32 -ladvapi32 -lwinmm -lole32 -lwinhttp -lgdiplus
 rem TweetNaCl is vendored as published, so its own warnings stay quiet.
 gcc %CFLAGS% -w -c src\tweetnacl.c -o build\tweetnacl.o || exit /b 1
 gcc %CFLAGS% -Wall -Wextra -municode -mwindows src\nexus.c src\link.c src\input.c src\audio.c src\files.c src\update.c build\tweetnacl.o build\nexus.res ^

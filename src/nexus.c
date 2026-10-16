@@ -61,17 +61,17 @@ static const Palette LIGHT = {
 enum { C_INK, C_INK2, C_INK3, C_SIGNAL, C_AMBER, C_FAULT, C_OFF };
 
 static const struct { const wchar_t *name, *title, *desc, *eyebrow; } PAGES[] = {
-    {L"Overview", L"OVERVIEW", L"The PCs this one works with, where input is right now, and how the links are doing.",
-     L"MACHINES"},
-    {L"Crossing", L"CROSSING",
+    {L"Overview", L"Overview", L"The PCs this one works with, where input is right now, and how the links are doing.",
+     L"Machines"},
+    {L"Crossing", L"Crossing",
      L"Where the PCs stand around this screen. Push the pointer through an edge to cross to the PC beside it, "
      L"and on from there to the next one.",
-     L"MAP"},
-    {L"Keyboard", L"KEYBOARD", L"Switch without the mouse, and a way home that always works.", L"SHORTCUTS"},
-    {L"Sound", L"SOUND", L"The controlled PC's sound, played on this PC's speakers.", L"SOUND"},
-    {L"Files", L"FILES", L"Copy files on one PC, switch, and paste them on another.", L"FILES"},
-    {L"Connection", L"CONNECTION", L"This PC's role, the password all the PCs share, and where to find the others.",
-     L"THIS PC"},
+     L"Map"},
+    {L"Keyboard", L"Keyboard", L"Switch without the mouse, and a way home that always works.", L"Shortcuts"},
+    {L"Sound", L"Sound", L"The controlled PC's sound, played on this PC's speakers.", L"Sound"},
+    {L"Files", L"Files", L"Copy files on one PC, switch, and paste them on another.", L"Files"},
+    {L"Connection", L"Connection", L"This PC's role, the password all the PCs share, and where to find the others.",
+     L"This PC"},
 };
 #define NPAGES ((int)(sizeof PAGES / sizeof PAGES[0]))
 
@@ -609,7 +609,7 @@ static void load_fonts(void)
     g.nav_font = mkfont(L"Hanken Grotesk", 15, FW_NORMAL);
     g.nav_sel = mkfont(L"Hanken Grotesk SemiBold", 15, FW_NORMAL);
     g.status_font = mkfont(L"Hanken Grotesk SemiBold", 15, FW_NORMAL);
-    g.eyebrow = mkfont(L"Hanken Grotesk SemiBold", 11, FW_NORMAL);
+    g.eyebrow = mkfont(L"Hanken Grotesk SemiBold", 16, FW_NORMAL); /* a card's heading */
     g.button = mkfont(L"Hanken Grotesk SemiBold", 14, FW_NORMAL);
     g.small = mkfont(L"Hanken Grotesk", 13, FW_NORMAL);
     g.mono = mkfont(L"B612 Mono", 13, FW_NORMAL);
@@ -747,24 +747,87 @@ static void fill(HDC dc, const RECT *r, COLORREF c)
     ExtTextOutW(dc, 0, 0, ETO_OPAQUE, r, NULL, 0, NULL);
 }
 
-static void round_rect(HDC dc, const RECT *r, int radius, COLORREF fill_c, COLORREF line_c, int width)
+/* Smooth shapes: GDI+ (part of Windows since XP) draws edges anti-aliased; text stays with GDI.
+ * The few flat-API functions used here, declared as gdiplus.dll exports them. */
+typedef struct { UINT32 version; void *debug; BOOL no_thread, no_codecs; } GpStartup;
+int WINAPI GdiplusStartup(ULONG_PTR *token, const GpStartup *in, void *out);
+int WINAPI GdipCreateFromHDC(HDC dc, void **gr);
+int WINAPI GdipDeleteGraphics(void *gr);
+int WINAPI GdipSetSmoothingMode(void *gr, int mode);
+int WINAPI GdipCreateSolidFill(DWORD argb, void **brush);
+int WINAPI GdipDeleteBrush(void *brush);
+int WINAPI GdipCreatePen1(DWORD argb, float width, int unit, void **pen);
+int WINAPI GdipSetPenStartCap(void *pen, int cap);
+int WINAPI GdipSetPenEndCap(void *pen, int cap);
+int WINAPI GdipSetPenLineJoin(void *pen, int join);
+int WINAPI GdipDeletePen(void *pen);
+int WINAPI GdipCreatePath(int fill_mode, void **path);
+int WINAPI GdipDeletePath(void *path);
+int WINAPI GdipAddPathArc(void *path, float x, float y, float w, float h, float start, float sweep);
+int WINAPI GdipClosePathFigure(void *path);
+int WINAPI GdipFillPath(void *gr, void *brush, void *path);
+int WINAPI GdipDrawPath(void *gr, void *pen, void *path);
+int WINAPI GdipFillEllipse(void *gr, void *brush, float x, float y, float w, float h);
+int WINAPI GdipDrawEllipse(void *gr, void *pen, float x, float y, float w, float h);
+int WINAPI GdipDrawArc(void *gr, void *pen, float x, float y, float w, float h, float start, float sweep);
+int WINAPI GdipDrawLine(void *gr, void *pen, float x1, float y1, float x2, float y2);
+enum { GP_ANTIALIAS = 4, GP_PIXEL = 2, GP_ROUND = 2 };
+
+static DWORD argb(COLORREF c, int alpha) { return (DWORD)alpha << 24 | GetRValue(c) << 16 | GetGValue(c) << 8 | GetBValue(c); }
+
+static void *smooth(HDC dc)
 {
-    HPEN pen = CreatePen(PS_SOLID, width, line_c);
-    HBRUSH br = fill_c == NO_FILL ? (HBRUSH)GetStockObject(NULL_BRUSH) : CreateSolidBrush(fill_c);
-    HGDIOBJ op = SelectObject(dc, pen), ob = SelectObject(dc, br);
-    RoundRect(dc, r->left, r->top, r->right, r->bottom, 2 * radius, 2 * radius);
-    SelectObject(dc, op);
-    SelectObject(dc, ob);
-    DeleteObject(pen);
-    if (fill_c != NO_FILL) DeleteObject(br);
+    void *gr = NULL;
+    GdipCreateFromHDC(dc, &gr);
+    GdipSetSmoothingMode(gr, GP_ANTIALIAS);
+    return gr;
 }
 
-static void dot(HDC dc, int x, int y, int size, COLORREF c)
+static void *rounded(float x, float y, float w, float h, float radius)
 {
-    HBRUSH b = CreateSolidBrush(c);
-    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, GetStockObject(NULL_PEN));
-    Ellipse(dc, x, y, x + size, y + size);
-    SelectObject(dc, ob), SelectObject(dc, op), DeleteObject(b);
+    void *path = NULL;
+    float d = max(1.0f, 2 * radius);
+    GdipCreatePath(0, &path);
+    GdipAddPathArc(path, x, y, d, d, 180, 90);
+    GdipAddPathArc(path, x + w - d, y, d, d, 270, 90);
+    GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0, 90);
+    GdipAddPathArc(path, x, y + h - d, d, d, 90, 90);
+    GdipClosePathFigure(path);
+    return path;
+}
+
+/* The outline runs just inside r, as GDI's RoundRect draws it. */
+static void round_rect(HDC dc, const RECT *r, int radius, COLORREF fill_c, COLORREF line_c, int width)
+{
+    void *gr = smooth(dc), *brush = NULL, *pen = NULL;
+    float half = width / 2.0f;
+    void *path = rounded(r->left + half, r->top + half, r->right - r->left - 2 * half, r->bottom - r->top - 2 * half,
+                         radius - half);
+    if (fill_c != NO_FILL) GdipCreateSolidFill(argb(fill_c, 255), &brush), GdipFillPath(gr, brush, path);
+    if (fill_c != line_c) GdipCreatePen1(argb(line_c, 255), (float)width, GP_PIXEL, &pen), GdipDrawPath(gr, pen, path);
+    if (brush) GdipDeleteBrush(brush);
+    if (pen) GdipDeletePen(pen);
+    GdipDeletePath(path);
+    GdipDeleteGraphics(gr);
+}
+
+/* A dot; alpha below 255 for the soft halo around a lit one. */
+static void dot_alpha(HDC dc, int x, int y, int size, COLORREF c, int alpha)
+{
+    void *gr = smooth(dc), *brush = NULL;
+    GdipCreateSolidFill(argb(c, alpha), &brush);
+    GdipFillEllipse(gr, brush, (float)x, (float)y, (float)size, (float)size);
+    GdipDeleteBrush(brush);
+    GdipDeleteGraphics(gr);
+}
+
+static void dot(HDC dc, int x, int y, int size, COLORREF c) { dot_alpha(dc, x, y, size, c, 255); }
+
+/* A status light: the dot, and a halo when it is lit (connected). */
+static void status_light(HDC dc, int x, int y, int size, int c)
+{
+    if (c == C_SIGNAL) dot_alpha(dc, x - size / 2, y - size / 2, 2 * size, color(c), 48);
+    dot(dc, x, y, size, color(c));
 }
 
 static int text(HDC dc, const wchar_t *s, RECT r, HFONT f, COLORREF c, UINT flags)
@@ -783,46 +846,64 @@ static int text_height(HDC dc, const wchar_t *s, int width, HFONT f)
     return r.bottom;
 }
 
-/* Line icons for the sidebar, drawn in a 24-unit box. */
 static void draw_icon(HDC dc, int page, int x, int y, COLORREF c)
 {
-#define P(a, b) x + S(a), y + S(b)
-    HPEN pen = CreatePen(PS_SOLID, S(2) > 1 ? S(2) - (S(2) > 2) : 1, c);
-    HGDIOBJ op = SelectObject(dc, pen), ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    /* Line icons for the sidebar in a 24-unit box, round-capped like Lucide's. */
+    float k = g.dpi / 96.0f;
+#define X(a) (x + (a) * k)
+#define Y(b) (y + (b) * k)
+#define LINE(a, b, c2, d) GdipDrawLine(gr, pen, X(a), Y(b), X(c2), Y(d))
+#define BOX(a, b, w, h, r) \
+    do { \
+        void *box = rounded(X(a), Y(b), (w) * k, (h) * k, (r) * k); \
+        GdipDrawPath(gr, pen, box); \
+        GdipDeletePath(box); \
+    } while (0)
+    void *gr = smooth(dc), *pen = NULL;
+    GdipCreatePen1(argb(c, 255), 1.75f * k, GP_PIXEL, &pen);
+    GdipSetPenStartCap(pen, GP_ROUND);
+    GdipSetPenEndCap(pen, GP_ROUND);
+    GdipSetPenLineJoin(pen, GP_ROUND);
     switch (page) {
-    case PAGE_OVERVIEW: /* screen and a second screen */
-        Rectangle(dc, P(2, 4), P(17, 15));
-        MoveToEx(dc, P(9, 15), NULL), LineTo(dc, P(9, 19));
-        MoveToEx(dc, P(5, 19), NULL), LineTo(dc, P(13, 19));
-        Rectangle(dc, P(14, 10), P(23, 20));
+    case PAGE_OVERVIEW: /* a screen and a second one */
+        BOX(2, 4, 14, 11, 2);
+        LINE(9, 15, 9, 19), LINE(6, 19, 12, 19);
+        BOX(14, 10, 8, 10, 2);
         break;
     case PAGE_CROSSING: /* arrows both ways */
-        MoveToEx(dc, P(3, 8), NULL), LineTo(dc, P(21, 8)), LineTo(dc, P(17, 4));
-        MoveToEx(dc, P(21, 16), NULL), LineTo(dc, P(3, 16)), LineTo(dc, P(7, 20));
+        LINE(3, 8, 21, 8), LINE(21, 8, 17, 4), LINE(21, 8, 17, 12);
+        LINE(21, 16, 3, 16), LINE(3, 16, 7, 12), LINE(3, 16, 7, 20);
         break;
     case PAGE_KEYBOARD:
-        RoundRect(dc, P(1, 5), P(23, 19), S(4), S(4));
-        for (int i = 0; i < 5; i++) Rectangle(dc, P(5 + 3 * i, 9), P(6 + 3 * i, 10));
-        MoveToEx(dc, P(7, 15), NULL), LineTo(dc, P(17, 15));
+        BOX(2, 5, 20, 14, 2.5f);
+        {
+            void *keys = NULL;
+            GdipCreateSolidFill(argb(c, 255), &keys);
+            for (int i = 0; i < 5; i++) GdipFillEllipse(gr, keys, X(5 + 3.5f * i), Y(8.5f), 2 * k, 2 * k);
+            GdipDeleteBrush(keys);
+        }
+        LINE(8, 15, 16, 15);
         break;
     case PAGE_SOUND: /* speaker */
-        MoveToEx(dc, P(3, 9), NULL), LineTo(dc, P(7, 9)), LineTo(dc, P(12, 4)), LineTo(dc, P(12, 20)),
-            LineTo(dc, P(7, 15)), LineTo(dc, P(3, 15)), LineTo(dc, P(3, 9));
-        Arc(dc, P(10, 7), P(20, 17), P(16, 18), P(16, 6));
-        Arc(dc, P(11, 3), P(24, 21), P(18, 22), P(18, 2));
+        LINE(3, 9, 7, 9), LINE(7, 9, 12, 4), LINE(12, 4, 12, 20), LINE(12, 20, 7, 15), LINE(7, 15, 3, 15),
+            LINE(3, 15, 3, 9);
+        GdipDrawArc(gr, pen, X(11), Y(8), 8 * k, 8 * k, -60, 120);
+        GdipDrawArc(gr, pen, X(10), Y(4), 14 * k, 16 * k, -65, 130);
         break;
     case PAGE_FILES: /* folder */
-        MoveToEx(dc, P(2, 6), NULL), LineTo(dc, P(9, 6)), LineTo(dc, P(11, 8)), LineTo(dc, P(22, 8)),
-            LineTo(dc, P(22, 19)), LineTo(dc, P(2, 19)), LineTo(dc, P(2, 6));
+        LINE(2, 7, 2, 18), LINE(2, 18, 22, 18), LINE(22, 18, 22, 9), LINE(22, 9, 12, 9), LINE(12, 9, 10, 6),
+            LINE(10, 6, 3, 6), LINE(3, 6, 2, 7);
         break;
     default: /* link */
-        Ellipse(dc, P(2, 6), P(14, 18));
-        Ellipse(dc, P(10, 6), P(22, 18));
+        GdipDrawEllipse(gr, pen, X(2), Y(6), 12 * k, 12 * k);
+        GdipDrawEllipse(gr, pen, X(10), Y(6), 12 * k, 12 * k);
     }
-#undef P
-    SelectObject(dc, op);
-    SelectObject(dc, ob);
-    DeleteObject(pen);
+#undef X
+#undef Y
+#undef LINE
+#undef BOX
+    GdipDeletePen(pen);
+    GdipDeleteGraphics(gr);
 }
 
 /* ---- owner-drawn controls: real BUTTON/STATIC controls, so Tab, Space and screen readers work ---- */
@@ -931,7 +1012,7 @@ static void draw_control(const DRAWITEMSTRUCT *d)
         if (kind == K_NAV) {
             int page = (int)d->CtlID - ID_NAV0;
             BOOL sel = page == g.page;
-            if (sel || hover) round_rect(dc, &r, S(6), sel ? p->well : p->panel, sel ? p->well : p->panel, 1);
+            if (sel || hover) round_rect(dc, &r, S(8), sel ? p->well : p->panel, sel ? p->well : p->panel, 1);
             if (sel) {
                 RECT bar = {0, S(10), S(3), h - S(10)};
                 fill(dc, &bar, p->signal);
@@ -944,25 +1025,27 @@ static void draw_control(const DRAWITEMSTRUCT *d)
             /* A chosen segment is filled like Beamer's primary button; the rest are outlined. */
             BOOL sel = kind == K_SEGMENT && is_selected((int)d->CtlID);
             RECT b = {0, 0, w, h};
-            if (sel) round_rect(dc, &b, S(5), p->ink, p->ink, S(1));
-            else round_rect(dc, &b, S(5), hover ? p->well : bg, hover ? p->ink2 : p->edge, S(1));
+            if (sel) round_rect(dc, &b, S(8), p->ink, p->ink, S(1));
+            else round_rect(dc, &b, S(8), hover ? p->well : bg, hover ? p->ink2 : p->edge, S(1));
             text(dc, label, r, g.button, sel ? p->ground : p->ink, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
         } else if (kind == K_TILE) {
             const Peer *pp = &g.peer[d->CtlID - ID_TILE0];
             RECT b = {0, 0, w, h}, t;
-            round_rect(dc, &b, S(6), hover ? p->rule : p->well, hover ? p->ink2 : p->edge, S(1));
-            dot(dc, S(12), S(15), S(8), color(status_color_of(pp->status)));
+            round_rect(dc, &b, S(10), hover ? p->rule : p->well, hover ? p->ink2 : p->edge, S(1));
+            status_light(dc, S(13), S(16), S(8), status_color_of(pp->status));
             SetRect(&t, S(26), S(8), w - S(8), S(30));
             text(dc, label, t, g.button, p->ink, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             SetRect(&t, S(12), S(30), w - S(8), S(50));
-            text(dc, pp->addr, t, g.small, p->ink3, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            /* Under the name, the address; with no name yet, the address is the name and the state goes here. */
+            text(dc, pp->name[0] ? pp->addr : STATUS_WORD[pp->status], t, g.small, p->ink3,
+                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         } else {
             COLORREF c = d->CtlID == ID_UPDATE ? p->signal : hover ? p->ink : p->ink3;
             text(dc, label, r, d->CtlID == ID_UPDATE ? g.button : g.small, c, DT_SINGLELINE | DT_VCENTER);
         }
         if (focus) {
             RECT f = {S(1), S(1), w - S(1), h - S(1)};
-            round_rect(dc, &f, S(6), NO_FILL, p->signal, S(2));
+            round_rect(dc, &f, S(9), NO_FILL, p->signal, S(2));
         }
     }
     BitBlt(d->hDC, 0, 0, w, h, dc, 0, 0, SRCCOPY);
@@ -1059,7 +1142,7 @@ static void layout(void)
     SetRect(&g.desc_rc, x0, S(92), x0 + width, S(92) + dh);
 
     int my = g.desc_rc.bottom + S(28), mx = x0 + S(32), mw = width - S(64), y = my + S(28);
-    add_label(L_LINE, mx, y, mw, S(24), PAGES[g.page].eyebrow, g.eyebrow, C_INK3, NULL);
+    add_label(L_LINE, mx, y, mw, S(24), PAGES[g.page].eyebrow, g.eyebrow, C_INK, NULL);
     y += S(24) + S(16);
     BOOL main_pc = g.cfg.role == ROLE_MAIN;
 
@@ -1155,7 +1238,7 @@ static void layout(void)
         y = add_text(mx, y, mw,
                      main_pc ? L"The main PC has the keyboard and mouse, and plays the other PCs' sound."
                              : L"The controlled PC is driven by the main PC's keyboard and mouse.",
-                     g.small, C_INK3) + S(28);
+                     g.small, C_INK3) + S(18);
         {
             int fw = min(mw, S(380));
             y = add_field_row(mx, y, fw, g.pw_label, g.pw,
@@ -1166,17 +1249,17 @@ static void layout(void)
                 int cw = min((mw - S(16)) / 2, S(300)), shown = 0, empty = 0;
                 for (int i = 0; i < MAX_PEERS; i++) {
                     if (!g.peer[i].addr[0] && empty++) continue;
-                    int fx = mx + (shown % 2) * (cw + S(16)), fyy = y + (shown / 2) * S(84);
+                    int fx = mx + (shown % 2) * (cw + S(16)), fyy = y + (shown / 2) * S(76);
                     place(g.addr_label[i], fx, fyy, cw, S(22));
                     add_label(L_WELL, fx, fyy + S(26), cw, S(40), NULL, NULL, 0, g.addr[i]);
                     place(g.addr[i], fx + S(12), fyy + S(26) + (S(40) - g.body_h) / 2, cw - S(24), g.body_h);
                     shown++;
                 }
-                y += (shown + 1) / 2 * S(84);
+                y += (shown + 1) / 2 * S(76);
                 y = add_text(mx, y, mw,
                              L"Each controlled PC shows its address on its own Connection page. Clear an address "
                              L"to remove that PC.",
-                             g.small, C_INK3) + S(16);
+                             g.small, C_INK3) + S(10);
                 int listed = 0;
                 for (int i = 0; i < MAX_FOUND; i++) {
                     BOOL added = FALSE;
@@ -1268,7 +1351,7 @@ static void render(HDC dc, RECT c)
     SetRect(&r, 0, S(STATUS_H), S(SIDEBAR), S(STATUS_H) + 1), fill(dc, &r, p->rule);
 
     /* Status block: where input is and how the link is. */
-    dot(dc, S(28), S(40), S(12), color(status_color()));
+    status_light(dc, S(28), S(37), S(12), status_color());
     SetRect(&r, S(52), S(30), S(SIDEBAR - 16), S(56));
     text(dc, g.line, r, g.status_font, p->ink, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     SetRect(&r, S(52), S(56), S(SIDEBAR - 16), S(80));
@@ -1295,28 +1378,26 @@ static void render(HDC dc, RECT c)
     SetRect(&r, g.desc_rc.left, S(40), g.desc_rc.right, S(40) + S(40));
     text(dc, PAGES[g.page].title, r, g.title, p->ink, DT_SINGLELINE | DT_VCENTER);
     text(dc, PAGES[g.page].desc, g.desc_rc, g.body, p->ink2, DT_WORDBREAK);
-    fill(dc, &g.module_rc, p->panel);
+    round_rect(dc, &g.module_rc, S(12), p->panel, p->rule, S(1));
     for (int i = 0; i < g.nlabels; i++) {
         const Label *l = &g.labels[i];
         switch (l->kind) {
         case L_TEXT: text(dc, l->s, l->r, l->f, color(l->color), DT_WORDBREAK); break;
         case L_LINE:
-            if (l->f == g.eyebrow) SetTextCharacterExtra(dc, S(11) * 14 / 100); /* Beamer's 0.14 em tracking */
             text(dc, l->s, l->r, l->f, color(l->color), DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-            SetTextCharacterExtra(dc, 0);
             break;
-        case L_DOT: dot(dc, l->r.left, l->r.top, l->r.right - l->r.left, color(l->color)); break;
+        case L_DOT: status_light(dc, l->r.left, l->r.top, l->r.right - l->r.left, l->color); break;
         case L_WELL:
-            round_rect(dc, &l->r, S(4), p->well, GetFocus() == l->edit ? p->signal : p->edge, S(1));
+            round_rect(dc, &l->r, S(8), p->well, GetFocus() == l->edit ? p->signal : p->edge, S(1));
             break;
         case L_KEYCAP:
-            round_rect(dc, &l->r, S(6), p->well, p->edge, S(1));
+            round_rect(dc, &l->r, S(8), p->well, p->edge, S(1));
             text(dc, l->s, l->r, l->f, color(l->color), DT_SINGLELINE | DT_VCENTER | DT_CENTER);
             break;
-        case L_CELL: round_rect(dc, &l->r, S(6), NO_FILL, p->rule, S(1)); break;
+        case L_CELL: round_rect(dc, &l->r, S(10), NO_FILL, p->rule, S(1)); break;
         case L_HOME: {
             RECT t = l->r;
-            round_rect(dc, &l->r, S(6), p->well, p->signal, S(2));
+            round_rect(dc, &l->r, S(10), p->well, p->signal, S(2));
             t.top += S(8), t.bottom = t.top + S(22), t.left += S(12), t.right -= S(8);
             text(dc, l->s, t, l->f, p->ink, DT_SINGLELINE | DT_VCENTER);
             OffsetRect(&t, 0, S(22));
@@ -2110,6 +2191,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     }
 
     g.inst = inst;
+    GpStartup gp_in = {1, NULL, FALSE, FALSE};
+    ULONG_PTR gp_token;
+    GdiplusStartup(&gp_token, &gp_in, NULL);
     /* Sharp text at 125%/150%; Vista added this, so XP takes the bitmap-scaled path it never had. */
     FARPROC dpi_aware = GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDPIAware");
     if (dpi_aware) dpi_aware();
