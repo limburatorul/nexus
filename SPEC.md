@@ -207,8 +207,13 @@ iar la final `FILE_END 16`. Părinții vin înaintea conținutului. Receptorul s
 - Pe un PC controlat cu Vista sau mai nou, inputul nu ajunge în ferestrele pornite ca administrator (UIPI)
   cât timp Nexus rulează neelevat. Soluția: pornire elevată prin Task Scheduler la logare.
 - Linux principal pe Wayland: fără scurtătură pentru a trece (nu există hook global de taste); se trece prin margine
-  (sau „Send input across” din tray), iar înapoi cu tasta de comutare sau Ctrl+Alt+Pause, cât timp inputul e
-  capturat. Stilul hold aduce inputul acasă la eliberarea tastei. Tastele de salt merg doar cât inputul e dincolo.
+  („Send input across” din tray împinge cursorul prin margine cu mișcare injectată; KWin, cel puțin Plasma 6.6 cu
+  InputCapture v1, nu declanșează bariera pentru mișcare injectată, așa că acolo apare doar o notificare), iar
+  înapoi cu tasta de comutare sau Ctrl+Alt+Pause, cât timp inputul e capturat. Stilul hold aduce inputul acasă la
+  eliberarea tastei. Tastele de salt merg doar cât inputul e dincolo. Fără captură, inputul nu poate sta dincolo
+  (desktopul nu dă nicio tastă), deci comanda de test `cross` pe un principal Linux e anulată imediat de
+  `capture_portal` cât timp captura e acordată: e comportamentul voit din Beamer, nu un bug; testele cu un
+  principal Linux rulează cu dialogul de captură nerăspuns (ca la 0.4) sau prin margine cu mouse-ul real.
 - Linux: cursorul PC-ului nefolosit nu se poate ascunde pe Wayland, iar full-screen hold nu are ce citi; lipsesc.
 - Monitoare decalate cu un gol între ele pe aceeași latură: poziția de-a lungul marginii se socotește peste gol.
 - Pe un PC controlat 0.4 sau mai vechi: fără rezistență pe marginea lui (trece la atingere), fără imagini în

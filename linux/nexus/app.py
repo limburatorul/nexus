@@ -1355,7 +1355,9 @@ def main() -> None:
         menu.addAction(QAction("Open Nexus", menu, triggered=win.showNormal))
         if c.cfg.role == "main":
             send = QAction("Bring input back" if c.remote else "Send input across", menu,
-                           triggered=lambda: c.home() if c.remote else c.capture and c.capture.push())
+                           triggered=lambda: c.home() if c.remote else c.capture and c.capture.push(
+                               lambda: c.notice.emit("Nexus", "This desktop hands input to Nexus only at an edge: "
+                                                     "push the pointer through the edge beside the other PC.")))
             send.setEnabled(c.first_connected() >= 0)
             menu.addAction(send)
             menu.addAction(QAction("Pause crossing", menu, checkable=True, checked=c.paused,

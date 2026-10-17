@@ -56,9 +56,15 @@ class Capture:
                 out.append(self._models[edge])
         return out
 
-    def push(self) -> bool:
-        """Tests: push the pointer through the edge with injected motion, as Beamer's shortcut does."""
-        return self.hooks.push_through(self.models(), self._cross, lambda: None)
+    def push(self, on_failed=None) -> bool:
+        """Push the pointer through the edge with injected motion, as Beamer's shortcut does (tests, and
+        the tray's Send input across). KWin does not let injected motion trip its barriers (seen on KDE
+        Plasma 6.6 with InputCapture v1), so there nothing is captured and on_failed runs (capture thread)."""
+        if self.hooks.push_through(self.models(), self._cross, on_failed or (lambda: None)):
+            return True
+        if on_failed:
+            on_failed()
+        return False
 
     # ---- the capture thread's callbacks ----
 
