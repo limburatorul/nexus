@@ -799,7 +799,7 @@ static void status_text(void)
         lstrcpynW(g.note, STATUS_NOTE[st], 256);
     } else if (g.remote && g.target >= 0) {
         _snwprintf(g.line, 256, L"Input on %ls", name);
-        _snwprintf(g.note, 256, L"Input is on %ls. Push back through its edge, double-tap Right Ctrl, "
+        _snwprintf(g.note, 256, L"Input is on %ls. Push back through its edge, use the switch key (Keyboard page), "
                                 L"or press Ctrl+Alt+Pause to return.", name);
     } else if (g.cfg.role == ROLE_CONTROLLED && input_controlled_active()) {
         _snwprintf(g.line, 256, L"Controlled by %ls", name);
@@ -808,7 +808,7 @@ static void status_text(void)
         lstrcpynW(g.line, L"Connected", 256);
         if (g.cfg.role == ROLE_MAIN)
             lstrcpynW(g.note, L"Push the pointer through an edge that leads to another PC (the Crossing page "
-                              L"shows which), or double-tap Right Ctrl to cross.", 256);
+                              L"shows which), or use the switch key on the Keyboard page.", 256);
         else _snwprintf(g.note, 256, L"Connected to %ls, the main PC.", name);
     }
     if (g.cfg.role == ROLE_MAIN && g.cfg.paused && !g.remote) wcscat(g.line, L", crossing paused");

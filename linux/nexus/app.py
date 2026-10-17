@@ -971,7 +971,7 @@ class Window(QWidget):
             line, note = STATUS_WORD[c.status], STATUS_NOTE[c.status]
         elif c.remote:
             line = "Input on %s" % c.name_of(c.target)
-            note = "Input is on %s. Push the pointer through an edge that leads on, double-tap Right Ctrl, or " \
+            note = "Input is on %s. Push the pointer through an edge that leads on, use the switch key, or " \
                    "press Ctrl+Alt+Pause to return." % c.name_of(c.target)
         elif c.cfg.role == "controlled" and c.injector.active:
             line, note = "Controlled by %s" % peer, "%s is driving this PC." % peer
@@ -1067,8 +1067,8 @@ class Window(QWidget):
                         continue
                     ways = self._ways_in(i)
                     lab = self._label("%s: through %s." % (c.name_of(i), ways) if ways else
-                                      "%s: no edge leads there. Move it beside a PC, or double-tap Right Ctrl when "
-                                      "it is the PC used last." % c.name_of(i))
+                                      "%s: no edge leads there. Move it beside a PC, or give it a jump key on the "
+                                      "Keyboard page." % c.name_of(i))
                     if not ways:
                         lab.setStyleSheet("color: %s;" % self.p["amber"])
                     m.addWidget(lab)
