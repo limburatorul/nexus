@@ -2,6 +2,8 @@
 Vernier look. Run with: python -m nexus [--test] [--tray]
 """
 
+import logging
+import logging.handlers
 import os
 import socket
 import struct
@@ -10,13 +12,14 @@ import tempfile
 import threading
 import time
 
-from PySide6.QtCore import QObject, QRect, QRectF, QSize, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QFont, QFontDatabase, QGuiApplication, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QBuffer, QIODevice, QObject, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon, QImage,
+                           QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
                                QScrollArea, QSizePolicy, QSystemTrayIcon, QVBoxLayout, QWidget)
 
-from . import VERSION, link, net, sound
-from .config import EDGES, MAP_H, MAP_W, MAX_PEERS, THIS_PC, Config
+from . import VERSION, keymap, link, net, sound
+from .config import EDGES, MAP_H, MAP_W, MAX_PEERS, THIS_PC, Config, config_dir
 from .discovery import PORT as DISCOVERY_PORT, TEST_PORT as TEST_DISCOVERY_PORT, Discovery
 from .files import Files
 
@@ -67,6 +70,55 @@ def fnv(path: str) -> str:
     return "%d %08x" % (size, h)
 
 
+LOG = logging.getLogger("nexus")
+
+
+def dib_to_png(dib: bytes):
+    """A Windows CF_DIB as PNG, through Qt's BMP reader (a file header in front); None when Qt cannot read it."""
+    if len(dib) < 40:
+        return None
+    size, bits, compression, used = struct.unpack_from("<I10xHI12xI", dib)
+    colours = used or (1 << bits if bits <= 8 else 0)
+    offset = 14 + size + colours * 4 + (12 if compression == 3 and size == 40 else 0)
+    image = QImage.fromData(b"BM" + struct.pack("<IHHI", 14 + len(dib), 0, 0, offset) + dib, "BMP")
+    if image.isNull():
+        return None
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    image.save(buf, "PNG")
+    return bytes(buf.data())
+
+
+def png_to_dib(png: bytes) -> bytes:
+    """A PNG as a Windows CF_DIB: Qt writes a BMP, and the DIB is that without its 14-byte file header."""
+    image = QImage.fromData(png, "PNG")
+    if image.isNull():
+        return b""
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    image.convertToFormat(QImage.Format_RGB32).save(buf, "BMP")
+    return bytes(buf.data())[14:]
+
+
+def wayland_locked() -> bool:
+    from . import wayland
+    return wayland.screen_locked()
+
+
+VK_NAMES = {0xA2: "Left Ctrl", 0xA3: "Right Ctrl", 0xA4: "Left Alt", 0xA5: "Right Alt", 0xA0: "Left Shift",
+            0xA1: "Right Shift", 0x5B: "Left Win", 0x5C: "Right Win", 0x13: "Pause", 0x14: "Caps Lock",
+            0x91: "Scroll Lock", 0x2D: "Insert", 0x2E: "Delete", 0x24: "Home", 0x23: "End", 0x21: "Page Up",
+            0x22: "Page Down", 0x5D: "Menu", 0x09: "Tab", 0xC0: "`"}
+
+
+def key_name(chord: int) -> str:
+    """"Ctrl + Alt + F1", "Right Ctrl": a recorded key (modifiers << 8 | Windows virtual key)."""
+    vk, mods = chord & 0xFF, chord >> 8
+    name = VK_NAMES.get(vk) or (chr(vk) if 0x30 <= vk <= 0x5A else "F%d" % (vk - 0x6F) if 0x70 <= vk <= 0x87
+                                else "Key %02X" % vk)
+    return "".join(m + " + " for bit, m in ((1, "Ctrl"), (2, "Alt"), (4, "Shift"), (8, "Win")) if mods & bit) + name
+
+
 def at_least(version: str, want) -> bool:
     try:
         return tuple(int(v) for v in version.split(".")) >= want
@@ -83,6 +135,8 @@ class Controller(QObject):
 
     changed = Signal()
     crossed = Signal(int, bool)  # input went to a PC, maybe from the capture thread: the clipboard follows
+    notice = Signal(str, str)  # title, text: a tray notification
+    jumped = Signal(int)  # a jump key named a PC (capture thread)
     _status = Signal(int, int)
     _message = Signal(int, bytes)
     _note = Signal(str)
@@ -98,6 +152,9 @@ class Controller(QObject):
         self.port = 24810 if test else link.PORT
         self.name = socket.gethostname()
         self.remote, self.target, self.last, self.audio_state, self.files_note = False, -1, -1, 0, ""
+        self.paused = False  # crossing paused from the tray or the Crossing page (this session only)
+        self.clip_in = link.ClipIn()
+        self._locked = 0  # lock checks in a row that found this controlled PC locked
         self.state = [net.SETUP] * MAX_PEERS  # each session's status, as this thread last heard it
         self.sessions, self.files = [], []
         for i in range(MAX_PEERS):
@@ -122,8 +179,10 @@ class Controller(QObject):
         self._audio.connect(self.on_audio)
         self._command.connect(self._run_command, Qt.BlockingQueuedConnection)
         self.crossed.connect(self.send_clipboard)
+        self.jumped.connect(self.jump)
         self.send = self._send
         self.timer = QTimer(self, interval=1000, timeout=self.tick)
+        self.beat_timer = QTimer(self, interval=250, timeout=self.beat)
 
     def start(self) -> None:
         self.injector.start()  # also the clipboard's way in, on either role
@@ -132,6 +191,7 @@ class Controller(QObject):
             s.start()
         self.discovery.start()
         self.timer.start()
+        self.beat_timer.start()
         if self.test:
             from .control import Control
             Control(lambda: self.cfg.key, self.name, VERSION, self.command).start()
@@ -210,6 +270,12 @@ class Controller(QObject):
             s.rtt, s.audio_state = None, 0
         elif self.cfg.role == "controlled":
             self.sound_capture.start()
+        elif s.mac and s.mac != self.cfg.macs[pc]:  # learnt for Wake-on-LAN
+            self.cfg.macs[pc] = s.mac
+            self.cfg.save()
+        if status != self.state[pc]:
+            LOG.info("link %d: %s%s", pc, STATUS_WORD[status],
+                     (", forward secret" if s.secret else ", password key only") if status == net.CONNECTED else "")
         self.state[pc] = status
         self.changed.emit()
 
@@ -218,6 +284,20 @@ class Controller(QObject):
         kind = msg[0]
         if kind == link.CLIPBOARD and len(msg) > 1:
             self.clipboard.set_text(msg[1:].decode("utf-8", "replace"))
+        elif link.CLIP_BEGIN <= kind <= link.CLIP_END:
+            done = self.clip_in.feed(msg)
+            if done:
+                text = done.get(link.CLIP_TEXT)
+                png = dib_to_png(done[link.CLIP_DIB]) if link.CLIP_DIB in done else None
+                self.clipboard.set_clip(text.decode("utf-8", "replace") if text else None, png)
+                LOG.info("clipboard: received %d bytes of text and a %d-byte picture", len(text or b""), len(png or b""))
+        elif kind == link.LOCKED and len(msg) == 1 and self.cfg.role == "main" and pc == self.target:
+            if self.capture:
+                self.capture.home(None, None)
+            self.target, self.remote = -1, False
+            self.notice.emit("Input came home", "%s is locked, so input is back here. Unlock it at that PC."
+                             % self.name_of(pc))
+            self.changed.emit()
         elif kind == link.PONG and len(msg) == 5:
             self.sessions[pc].rtt = ((int(time.monotonic() * 1000) & 0xFFFFFFFF) -
                                      struct.unpack("<I", msg[1:])[0]) & 0xFFFFFFFF
@@ -257,6 +337,68 @@ class Controller(QObject):
         if self.discovery.expire():
             self.changed.emit()
 
+    def beat(self) -> None:
+        """Every 250 ms. While input is across, a link silent for 2 s is gone and input comes home at once
+        (port of Beamer's ACK heartbeat, core/receiver.py); a controlled PC with input pings too, and
+        hands input back when its screen is locked."""
+        now = time.monotonic()
+        for i, s in enumerate(self.sessions):
+            s.beat = i == (self.target if self.cfg.role == "main" else 0 if self.injector.active else -1)
+        if self.cfg.role == "main" and self.target >= 0:
+            pc, s = self.target, self.sessions[self.target]
+            if now - s.heard > link.DEAD_SECONDS:
+                LOG.info("link %d: silent for %.1f s while it had input; input comes home", pc, now - s.heard)
+                if self.capture:
+                    self.capture.home(None, None)
+                self.target, self.remote = -1, False
+                s.drop()
+                self.notice.emit("Input came home", "%s stopped answering, so input is back on this PC."
+                                 % self.name_of(pc))
+                self.changed.emit()
+        elif self.cfg.role == "controlled" and self.injector.active and self.state[0] == net.CONNECTED:
+            s, stop = self.sessions[0], False
+            if now - s.heard > link.DEAD_SECONDS:
+                stop = True
+            self._locked = self._locked + 1 if wayland_locked() else 0
+            if self._locked >= 2:  # twice in a row, not a flicker
+                LOG.info("this PC's screen is locked: input goes back to the main PC")
+                s.send(bytes([link.LOCKED]) if link.v5(s.peer_version) else bytes([link.LEAVE, 0, 0, 0]))
+                stop, self._locked = True, 0
+            if stop:
+                self.injector.release_all()
+                self.injector.active = False
+                self.changed.emit()
+
+    @Slot(int)
+    def jump(self, pc: int) -> None:
+        """A jump key: input goes straight to pc, or it is woken when it is asleep."""
+        if self.up(pc):
+            if pc != self.target:
+                self.cross(pc)
+        else:
+            self.wake(pc)
+
+    def wake(self, pc: int) -> None:
+        """Wake-on-LAN: the magic packet to the broadcast address. The MAC comes from the kernel's
+        neighbour table after a connection (net.arp_mac). Port of Beamer core/wol.py."""
+        mac = self.cfg.macs[pc] or self.sessions[pc].mac
+        if not mac:
+            self.notice.emit("Nexus", "%s is not connected." % self.name_of(pc))
+            return
+        packet = b"\xff" * 6 + bytes.fromhex(mac.replace("-", "")) * 16
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            try:
+                s.sendto(packet, ("255.255.255.255", 9))
+            except OSError:
+                pass
+        self.notice.emit("Wake-on-LAN", "Waking %s. It connects by itself once it is up." % self.name_of(pc))
+
+    def set_paused(self, paused: bool) -> None:
+        self.paused = paused
+        LOG.info("crossing %s", "paused" if paused else "resumed")
+        self.changed.emit()
+
     # ---- crossing between the PCs on the map (main PC) ----
 
     def enter_peer(self, pc: int, edge: int, keep: bool, frac: int, relay: bool = False) -> None:
@@ -264,8 +406,11 @@ class Controller(QObject):
         pointer stays where it is over there). From any thread; the clipboard follows on the Qt thread,
         and with `relay` what came from the PC before goes on too."""
         s = self.sessions[pc]
-        msg = bytes([link.ENTER, edge, int(keep)]) + struct.pack("<H", frac) + bytes([self.exits(pc)])
-        s.send(msg if at_least(s.peer_version, (0, 3, 0)) else msg[:5])  # before 0.3: one way back only
+        msg = bytes([link.ENTER, edge, int(keep)]) + struct.pack("<H", frac) + bytes([self.exits(pc),
+                                                                                       self.cfg.resistance // 4])
+        # before 0.3: one way back only; before 0.5: no resistance
+        s.send(msg if link.v5(s.peer_version) else msg[:6] if at_least(s.peer_version, (0, 3, 0)) else msg[:5])
+        LOG.info("input to link %d", pc)
         self.target = self.last = pc
         self.crossed.emit(pc, relay)
         self.changed.emit()
@@ -298,11 +443,31 @@ class Controller(QObject):
         if not got:
             return
         kind, value = got
+        if kind == "text":  # get(), for a relay: text only
+            kind, value = "clip", (value, None)
+        s = self.sessions[pc]
         if kind == "files":
             if not self.files[pc].send_paths(value, self.name_of(pc)):
                 self.on_note("Still sending the last files; copy the new ones again once they are across.")
-        else:
-            self.sessions[pc].send(bytes([link.CLIPBOARD]) + value.encode("utf-8")[:link.MAX - 1])
+            return
+        text, png = value
+        data = text.encode("utf-8") if text else b""
+        if not link.v5(s.peer_version):  # an older peer: text up to 64 KB, as before
+            if data and len(data) < link.MAX:
+                s.send(bytes([link.CLIPBOARD]) + data)
+            return
+        # Text and picture together; over a limit that part stays behind, never cut short.
+        dib = png_to_dib(png) if png else b""
+        sent = False
+        for fmt, part in ((link.CLIP_TEXT, data), (link.CLIP_DIB, dib)):
+            if part and len(part) <= link.CLIP_MAX[fmt]:
+                for msg in link.clip_out(fmt, part):
+                    s.send(msg)
+                sent = True
+            elif part:
+                LOG.info("clipboard: %d bytes of format %d stay here (over the limit)", len(part), fmt)
+        if sent:
+            s.send(bytes([link.CLIP_END]))
 
     def cross(self, pc: int = -1) -> bool:
         """Main PC: input goes to pc, else the PC used last (the shortcut and tests end here)."""
@@ -323,6 +488,13 @@ class Controller(QObject):
             self._send(bytes([link.LEAVE, 0, 0, 0]))
             self.target, self.remote = -1, False
             self.changed.emit()
+
+    def save_setting(self, **values) -> None:
+        """A setting that needs no new connection (resistance, keys)."""
+        for k, v in values.items():
+            setattr(self.cfg, k, v)
+        self.cfg.save()
+        self.changed.emit()
 
     def set_config(self, **values) -> None:
         for k, v in values.items():
@@ -371,9 +543,48 @@ class Controller(QObject):
         if verb == "status":  # about the PC with input, else the one used last or the first one
             pc = max(self.shown(), 0)
             s = self.sessions[pc]
-            return "role=%s status=%d peer=%s peer_version=%s remote=%d active=%d audio=%d version=%s files=%s" % (
+            return ("role=%s status=%d peer=%s peer_version=%s remote=%d active=%d audio=%d version=%s secret=%d "
+                    "files=%s") % (
                 self.cfg.role, self.status, s.peer, s.peer_version, self.remote, self.injector.active,
-                s.audio_state if self.cfg.role == "main" else self.audio_state, VERSION, self.files_note)
+                s.audio_state if self.cfg.role == "main" else self.audio_state, VERSION, s.secret, self.files_note)
+        if verb == "clip-image":  # "clip-image W H": the same test picture as on Windows, as if copied
+            w, h = (int(v) for v in arg.split())
+            image = QImage(w, h, QImage.Format_RGB32)
+            for y in range(h):
+                for x in range(w):
+                    image.setPixel(x, y, 0xFF000000 | ((x ^ y) & 0xFF) << 16 | (y * 5 & 0xFF) << 8 | ((x * 7 + y) & 0xFF))
+            buf = QBuffer()
+            buf.open(QIODevice.WriteOnly)
+            image.save(buf, "PNG")
+            png = bytes(buf.data())
+            self.clipboard.set_clip(None, png)
+            self.clipboard._forced = ("clip", (None, png))
+            return "ok"
+        if verb == "clip-image-get":  # "W H fnv" of the picture's pixels, top row first, as RGB
+            png = self.clipboard.get_png()
+            image = QImage.fromData(png, "PNG") if png else QImage()
+            if image.isNull():
+                return "none"
+            h = 2166136261
+            for y in range(image.height()):
+                for x in range(image.width()):
+                    p = image.pixel(x, y)
+                    for v in (p >> 16 & 0xFF, p >> 8 & 0xFF, p & 0xFF):
+                        h = ((h ^ v) * 16777619) & 0xFFFFFFFF
+            return "%d %d %08x" % (image.width(), image.height(), h)
+        if verb == "clip-big":  # "clip-big N": N characters, too many for one message
+            text = "".join("\n" if i % 61 == 60 else chr(97 + i % 26) for i in range(int(arg)))
+            self.clipboard.set_text(text)
+            self.clipboard._forced = ("text", text)
+            return "ok"
+        if verb == "clip-hash":  # "length fnv" of the clipboard's text as UTF-8
+            got = self.clipboard.get()
+            if not got or got[0] != "text":
+                return "none"
+            data, h = got[1].encode("utf-8"), 2166136261
+            for v in data:
+                h = ((h ^ v) * 16777619) & 0xFFFFFFFF
+            return "%d %08x" % (len(data), h)
         if verb == "peers":  # pc x,y status name, one per line
             return "".join("%d %d,%d %d %s%s\n" % (i, *self.cfg.places[i], self.state[i], self.name_of(i),
                                                    " *" if i == self.target else "")
@@ -620,6 +831,7 @@ class Window(QWidget):
         self.c = c
         self.page = 0
         self.focus_tile = None  # the map tile the arrow keys moved, focused again once rebuilt
+        self.recording = 0  # the Keyboard page waits for a key: 1 the switch key, 2 + n PC n's jump key
         self.setObjectName("root")
         self.setWindowTitle("Nexus (test)" if c.test else "Nexus")
         self.setWindowIcon(QIcon(os.path.join(RES, "nexus.ico")))
@@ -784,6 +996,8 @@ class Window(QWidget):
             b.setIcon(page_icon(i, p["ink"] if i == self.page else p["ink2"]))
         # Rebuilt only when what it shows changes: not for each response time, never under the typing hand.
         shape = (self.page, note, c.cfg.role, tuple(c.cfg.peers), tuple(c.cfg.places), bool(c.cfg.key),
+                 c.cfg.resistance, c.cfg.switch_key, c.cfg.switch_style, tuple(c.cfg.jumps), tuple(c.cfg.macs),
+                 c.paused, self.recording, tuple(s.secret for s in c.sessions),
                  tuple(c.state), tuple(s.peer for s in c.sessions), tuple(s.audio_state for s in c.sessions),
                  c.audio_state, c.sound_from(), c.files_note,
                  tuple(sorted((ip, v[:2]) for ip, v in c.discovery.found.items())))
@@ -828,9 +1042,15 @@ class Window(QWidget):
                     row.addSpacing(6)
                     row.addWidget(self._label(c.name_of(i) if main or c.up(i) else "Main PC", "line"), 1)
                     m.addLayout(row)
-                    m.addWidget(self._label("Controlled PC  ·  %s  ·  %s" % (c.cfg.peers[i], STATUS_WORD[c.state[i]])
-                                            if main else "Main PC  ·  connects to this PC on port %d" % c.port,
+                    sealed = "" if not c.up(i) else "  ·  forward secret" if c.sessions[i].secret else \
+                        "  ·  password key only (older Nexus)"
+                    m.addWidget(self._label(("Controlled PC  ·  %s  ·  %s" % (c.cfg.peers[i], STATUS_WORD[c.state[i]])
+                                             if main else "Main PC  ·  connects to this PC on port %d" % c.port) + sealed,
                                             "small"))
+                    if main and not c.up(i) and (c.cfg.macs[i] or c.sessions[i].mac):
+                        wake = QPushButton("Wake %s" % c.name_of(i), objectName="link")
+                        wake.clicked.connect(lambda _=False, i=i: c.wake(i))
+                        m.addWidget(wake, 0, Qt.AlignLeft)
                     m.addSpacing(8)
                 m.addWidget(self._label(note))
         elif self.page == 1:
@@ -856,10 +1076,37 @@ class Window(QWidget):
                 m.addWidget(self._label("Drag a PC to another cell, or select it and use the arrow keys. A PC "
                                         "crosses to the one beside it and back the same way. The pointer arrives at "
                                         "the same height, and what you copied comes along.", "small"))
+                m.addSpacing(16)
+                m.addWidget(self._label("Edge resistance", "line"))
+                row = QHBoxLayout()
+                for label, px in (("Touch", 0), ("Light", 60), ("Normal", 120), ("Firm", 240)):
+                    b = QPushButton(label, checkable=True, checked=c.cfg.resistance == px)
+                    b.setAccessibleName("Edge resistance: %s" % label)
+                    b.clicked.connect(lambda _=False, px=px: c.save_setting(resistance=px))
+                    row.addWidget(b)
+                row.addStretch(1)
+                m.addLayout(row)
+                m.addWidget(self._label("An edge gives once the pointer has pushed against it a little, so a "
+                                        "window's Close button or a panel at the edge stays reachable. The last few "
+                                        "pixels at each corner never cross. Touch crosses at once, as before 0.5.",
+                                        "small"))
+                pause = QPushButton("Pause crossing: input stays on this PC", checkable=True, checked=c.paused)
+                pause.clicked.connect(lambda on: c.set_paused(on))
+                m.addWidget(pause, 0, Qt.AlignLeft)
         elif self.page == 2:
-            for keys, what in (("Right Ctrl  × 2", "Switch input back to this PC." if main else
-                                "Switch input between the PCs."),
-                               ("Ctrl + Alt + Pause", "Bring input back to this PC at once.")):
+            switch = key_name(c.cfg.switch_key) + ("" if c.cfg.switch_style == "hold" else "  × 2")
+            rows = [(switch if main else "Set on the main PC",
+                     ("Hold it, let go: input comes back to this PC." if c.cfg.switch_style == "hold" else
+                      "Double-tap it: input comes back to this PC.") if main else "Switch input between the PCs."),
+                    ("Ctrl + Alt + Pause", "Bring input back to this PC at once.")]
+            if main:
+                rows += [("Press a key…" if self.recording == 2 + i else key_name(c.cfg.jumps[i]) if c.cfg.jumps[i]
+                          else "None", "Straight to %s, wherever input is." % c.name_of(i))
+                         for i in range(MAX_PEERS) if c.cfg.peers[i]]
+                if self.recording == 1:
+                    rows[0] = ("Press a key…", rows[0][1])
+            records = [1, None] + [2 + i for i in range(MAX_PEERS) if c.cfg.peers[i]]  # what each row's button sets
+            for n, (keys, what) in enumerate(rows):
                 row = QHBoxLayout()
                 cap = self._label(keys, "keycap", wrap=False)
                 cap.setFixedWidth(190)
@@ -867,10 +1114,24 @@ class Window(QWidget):
                 row.addWidget(cap)
                 row.addSpacing(20)
                 row.addWidget(self._label(what), 1)
+                if main and records[n]:
+                    b = QPushButton("Change" if n == 0 else "Set")
+                    b.setAccessibleName("Change the switch key" if n == 0 else "Set the jump key: " + what)
+                    b.clicked.connect(lambda _=False, r=records[n]: self.record(r))
+                    row.addWidget(b)
                 m.addLayout(row)
-            m.addWidget(self._label("Both work on this PC's keyboard while input is on another PC; to cross, push "
-                                    "the pointer through an edge." if main else
-                                    "These are pressed on the main PC's keyboard.", "small"))
+                if main and n == 0:
+                    styles = QHBoxLayout()
+                    for style, label in (("tap", "Double-tap"), ("hold", "Hold")):
+                        b = QPushButton(label, checkable=True, checked=c.cfg.switch_style == style)
+                        b.clicked.connect(lambda _=False, s=style: c.save_setting(switch_style=s))
+                        styles.addWidget(b)
+                    styles.addStretch(1)
+                    m.addLayout(styles)
+            m.addWidget(self._label("These work on this PC's keyboard while input is on another PC; to cross, push "
+                                    "the pointer through an edge (Wayland lets no app see keys before that). A jump "
+                                    "key is Ctrl, Alt or Win with another key; Esc while setting one takes it away."
+                                    if main else "These are pressed on the main PC's keyboard.", "small"))
         elif self.page == 3:
             m.addWidget(self._label(self._sound_text()))
         elif self.page == 4:
@@ -965,6 +1226,41 @@ class Window(QWidget):
         m.addSpacing(16)
         m.addWidget(self._label("This PC's address: %s  ·  port %d" % (local_addresses(), c.port)))
 
+    def record(self, what: int) -> None:
+        """The next key pressed in this window sets the switch key (1) or PC n's jump key (2 + n)."""
+        self.recording = what
+        self.setFocus()
+        self.grabKeyboard()
+        self.refresh()
+
+    def keyPressEvent(self, e) -> None:
+        if not self.recording or e.isAutoRepeat():
+            return super().keyPressEvent(e)
+        what, c = self.recording, self.c
+        win = keymap.to_windows(e.nativeScanCode() - 8)  # an XKB keycode is the evdev code + 8
+        vk = win[0] if win else 0
+        if e.key() == Qt.Key_Escape:
+            if what >= 2:
+                jumps = list(c.cfg.jumps)
+                jumps[what - 2] = 0
+                c.save_setting(jumps=jumps)
+        elif what == 1:
+            if not vk or e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+                return  # not those: they would switch while typing
+            c.save_setting(switch_key=vk)
+        else:
+            mods = e.modifiers()
+            chord = ((1 if mods & Qt.ControlModifier else 0) | (2 if mods & Qt.AltModifier else 0) |
+                     (4 if mods & Qt.ShiftModifier else 0) | (8 if mods & Qt.MetaModifier else 0))
+            if not vk or e.key() in (Qt.Key_Control, Qt.Key_Alt, Qt.Key_Shift, Qt.Key_Meta) or not chord & 11:
+                return  # wait for Ctrl, Alt or Win with another key
+            jumps = [0 if j == chord << 8 | vk else j for j in c.cfg.jumps]  # one chord, one PC
+            jumps[what - 2] = chord << 8 | vk
+            c.save_setting(jumps=jumps)
+        self.recording = 0
+        self.releaseKeyboard()
+        self.refresh()
+
     def closeEvent(self, event) -> None:  # closing keeps Nexus in the tray
         event.ignore()
         self.hide()
@@ -979,10 +1275,50 @@ def local_addresses() -> str:
         return "unknown"
 
 
+def tray_icon(badge) -> QIcon:
+    """The app icon with a coloured dot in its corner while input is elsewhere (None: as it is)."""
+    base = QIcon(os.path.join(RES, "nexus.ico"))
+    if not badge:
+        return base
+    pix = base.pixmap(64, 64)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(QPen(QColor("#0e0f0d"), 4))
+    p.setBrush(QColor(badge))
+    p.drawEllipse(QRectF(34, 34, 28, 28))
+    p.end()
+    return QIcon(pix)
+
+
+def start_log(test: bool) -> str:
+    """nexus.log (test.log) beside the config, 1 MB and one older file, and crash.log for an exception
+    nothing caught, on any thread. Port of the idea in Beamer core/crash_log.py. Returns the folder."""
+    import threading as _threading
+    import traceback
+    folder = config_dir()
+    os.makedirs(folder, exist_ok=True)
+    fmt = "%(asctime)s %(name)s %(levelname)s %(message)s"
+    handler = logging.handlers.RotatingFileHandler(os.path.join(folder, "test.log" if test else "nexus.log"),
+                                                   maxBytes=1024 * 1024, backupCount=1, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(fmt))
+    logging.basicConfig(level=logging.INFO, format=fmt)
+    logging.getLogger().addHandler(handler)
+
+    def crashed(kind, value, tb, thread=""):
+        text = "".join(traceback.format_exception(kind, value, tb))
+        LOG.error("crash%s: %s", thread, text)
+        with open(os.path.join(folder, "crash.log"), "a", encoding="utf-8") as f:
+            f.write("%s%s\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), thread, text))
+    sys.excepthook = crashed
+    _threading.excepthook = lambda a: crashed(a.exc_type, a.exc_value, a.exc_traceback,
+                                              " in thread %s" % (a.thread.name if a.thread else "?"))
+    return folder
+
+
 def main() -> None:
-    import logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     test = "--test" in sys.argv
+    log_folder = start_log(test)
+    LOG.info("Nexus %s starts", VERSION)
     if test:  # kill -USR1 prints every thread's stack to the log, for hangs
         import faulthandler
         import signal
@@ -999,13 +1335,51 @@ def main() -> None:
     desktop_portal.refresh_qt_screens()
     c = Controller(test)
     win = Window(c)
-    tray = QSystemTrayIcon(QIcon(os.path.join(RES, "nexus.ico")), app)
+    icons = {None: tray_icon(None), "away": tray_icon(DARK["signal"]), "paused": tray_icon(DARK["amber"])}
+    tray = QSystemTrayIcon(icons[None], app)
     menu = QMenu()
-    menu.addAction(QAction("Open Nexus", menu, triggered=win.showNormal))
-    menu.addSeparator()
-    menu.addAction(QAction("Quit", menu, triggered=app.quit))
+
+    def about():
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.about(win, "About Nexus",
+                          "Nexus %s\n\nOne keyboard, mouse and sound for PCs from Windows XP to 11 and Linux.\n\n%s\n\n"
+                          "GPL-3.0-or-later. The look and much of the crossing logic come from Beamer by Toby George "
+                          "Read Kalkman (GPL-3.0); the fonts are Hanken Grotesk and B612 Mono (SIL OFL)." % (VERSION, SITE))
+
+    def fill_menu():
+        """The menu says what is true now: built again each time it opens, and when the state changes."""
+        menu.clear()
+        head = menu.addAction("Nexus %s" % VERSION)
+        head.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction(QAction("Open Nexus", menu, triggered=win.showNormal))
+        if c.cfg.role == "main":
+            send = QAction("Bring input back" if c.remote else "Send input across", menu,
+                           triggered=lambda: c.home() if c.remote else c.capture and c.capture.push())
+            send.setEnabled(c.first_connected() >= 0)
+            menu.addAction(send)
+            menu.addAction(QAction("Pause crossing", menu, checkable=True, checked=c.paused,
+                                   triggered=lambda on: c.set_paused(on)))
+            for i in range(MAX_PEERS):
+                if c.cfg.peers[i] and not c.up(i) and (c.cfg.macs[i] or c.sessions[i].mac):
+                    menu.addAction(QAction("Wake %s" % c.name_of(i), menu, triggered=lambda _=False, i=i: c.wake(i)))
+        menu.addSeparator()
+        menu.addAction(QAction("Open log folder", menu,
+                               triggered=lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(log_folder))))
+        menu.addAction(QAction("About Nexus", menu, triggered=about))
+        menu.addSeparator()
+        menu.addAction(QAction("Quit", menu, triggered=app.quit))
+
+    def state():
+        away = c.remote if c.cfg.role == "main" else c.status == net.CONNECTED and not c.injector.active
+        tray.setIcon(icons["away" if away else "paused" if c.cfg.role == "main" and c.paused else None])
+        tray.setToolTip("Nexus: %s" % win.line.text())
+        fill_menu()
     tray.setContextMenu(menu)
+    c.changed.connect(state)
+    c.notice.connect(lambda title, text: (LOG.info("notice: %s", text), tray.showMessage(title, text)))
     tray.activated.connect(lambda reason: win.showNormal() if reason == QSystemTrayIcon.Trigger else None)
+    state()
     tray.show()
     c.start()
     if "--tray" not in sys.argv:

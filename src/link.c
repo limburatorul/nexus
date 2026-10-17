@@ -1,8 +1,13 @@
 /* Handshake: each side sends "NXUS", the link version, its role and a fresh 24-byte nonce in clear.
  * SHA-512(key || main nonce || controlled nonce) gives one 32-byte key per direction. Every frame is
  * then u32 length (LE) + XSalsa20-Poly1305 ciphertext, its nonce the direction's frame counter.
- * The first frame each way is HELLO with the PC's name: if it does not open, the passwords differ. */
+ * The first frame each way is HELLO with the PC's name: if it does not open, the passwords differ.
+ * Forward secrecy (0.5): when both HELLOs name Nexus 0.5 or later, each side then sends KEX with a
+ * fresh X25519 public key, and the keys become SHA-512(first hash || shared secret || main key ||
+ * controlled key), counters from 0. A password learnt later no longer opens a recorded session.
+ * Port of Beamer WIRE.md's "token mixed with an ephemeral X25519" idea (GPL-3, Toby George Read Kalkman). */
 
+#include <stdlib.h>
 #include <string.h>
 #include "link.h"
 #include <ntsecapi.h> /* RtlGenRandom: advapi32's SystemFunction036, Windows XP and later */
@@ -89,6 +94,13 @@ int link_recv(Link *l, unsigned char *out, int cap)
     return len;
 }
 
+int link_v5(const char *v)
+{
+    char *end;
+    long major = strtol(v, &end, 10);
+    return end != v && (major > 0 || (*end == '.' && strtol(end + 1, NULL, 10) >= 5));
+}
+
 int link_handshake(Link *l, SOCKET s, int is_main, const unsigned char key[32], const char *name, const char *version,
                    char peer[64], char peer_version[16])
 {
@@ -110,6 +122,7 @@ int link_handshake(Link *l, SOCKET s, int is_main, const unsigned char key[32], 
     memcpy(l->krx, is_main ? h + 32 : h, 32);
     l->s = s;
     l->ntx = l->nrx = 0;
+    l->forward_secret = 0;
 
     int n = (int)strlen(name), v = (int)strlen(version);
     if (n > 63) n = 63;
@@ -127,5 +140,95 @@ int link_handshake(Link *l, SOCKET s, int is_main, const unsigned char key[32], 
     const char *their_name = (const char *)msg + 1, *nul = memchr(their_name, 0, r - 1);
     lstrcpynA(peer, their_name, 64);
     lstrcpynA(peer_version, nul ? nul + 1 : "", 16); /* Nexus 0.1.0 sent the name alone */
+    if (!link_v5(version) || !link_v5(peer_version)) return LINK_OK; /* a 0.4 peer: the password's keys only */
+
+    /* Both sides know from the (authenticated) HELLOs that the other does this, so neither waits in vain. */
+    unsigned char sk[32], pk[32], mix[64 + 32 + 64];
+    randombytes(sk, 32);
+    crypto_scalarmult_base(pk, sk);
+    msg[0] = MSG_KEX;
+    memcpy(msg + 1, pk, 32);
+    if (!link_send(l, msg, 33)) return LINK_ERR_NET;
+    r = link_recv(l, msg, sizeof msg);
+    if (r == LINK_RECV_FORGED) return LINK_ERR_PASSWORD;
+    if (r < 1) return LINK_ERR_NET;
+    if (r != 33 || msg[0] != MSG_KEX) return LINK_ERR_PEER;
+    memcpy(mix, h, 64);
+    if (crypto_scalarmult(mix + 64, sk, msg + 1) != 0) return LINK_ERR_PEER;
+    memcpy(mix + 96, is_main ? pk : msg + 1, 32);
+    memcpy(mix + 128, is_main ? msg + 1 : pk, 32);
+    crypto_hash(h, mix, sizeof mix);
+    memcpy(l->ktx, is_main ? h : h + 32, 32);
+    memcpy(l->krx, is_main ? h + 32 : h, 32);
+    l->ntx = l->nrx = 0;
+    l->forward_secret = 1;
+    SecureZeroMemory(sk, sizeof sk);
+    SecureZeroMemory(mix, sizeof mix);
     return LINK_OK;
+}
+
+BOOL clip_out(int format, const void *data, unsigned int size, BOOL (*send)(int to, const unsigned char *msg, int len),
+              int to)
+{
+    static unsigned char m[LINK_MAX];
+    m[0] = MSG_CLIP_BEGIN, m[1] = (unsigned char)format;
+    for (int i = 0; i < 4; i++) m[2 + i] = (unsigned char)(size >> (8 * i));
+    if (!send(to, m, 6)) return FALSE;
+    for (unsigned int at = 0; at < size;) {
+        unsigned int n = size - at < LINK_MAX - 1 ? size - at : LINK_MAX - 1;
+        m[0] = MSG_CLIP_DATA;
+        memcpy(m + 1, (const unsigned char *)data + at, n);
+        if (!send(to, m, (int)n + 1)) return FALSE;
+        at += n;
+    }
+    return TRUE;
+}
+
+void clip_in_free(ClipIn *c)
+{
+    for (int f = 0; f < 3; f++) free(c->data[f]);
+    memset(c, 0, sizeof *c);
+}
+
+BOOL clip_in(ClipIn *c, const unsigned char *m, int n)
+{
+    if (m[0] == MSG_CLIP_BEGIN && n == 6 && (m[1] == CLIP_TEXT || m[1] == CLIP_DIB)) {
+        unsigned int size = m[2] | m[3] << 8 | m[4] << 16 | (unsigned int)m[5] << 24;
+        int f = m[1];
+        free(c->data[f]);
+        c->data[f] = NULL, c->size[f] = c->got[f] = 0, c->format = 0;
+        /* Over the limit or empty: that part stays behind, as Beamer does, never cut short. */
+        if (size && size <= (f == CLIP_TEXT ? CLIP_TEXT_MAX : CLIP_IMAGE_MAX) && (c->data[f] = malloc(size)))
+            c->size[f] = size, c->format = f;
+    } else if (m[0] == MSG_CLIP_DATA && c->format) {
+        int f = c->format;
+        if ((unsigned int)(n - 1) > c->size[f] - c->got[f]) { /* more than announced: not ours to trust */
+            free(c->data[f]);
+            c->data[f] = NULL, c->size[f] = c->got[f] = 0, c->format = 0;
+        } else {
+            memcpy(c->data[f] + c->got[f], m + 1, n - 1);
+            c->got[f] += n - 1;
+        }
+    } else if (m[0] == MSG_CLIP_END && n == 1) {
+        c->format = 0;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL clip_dib_ok(const unsigned char *d, unsigned int size)
+{
+    if (size < 40) return FALSE;
+    const BITMAPINFOHEADER *h = (const BITMAPINFOHEADER *)d;
+    LONG height = h->biHeight < 0 ? -h->biHeight : h->biHeight;
+    int bits = h->biBitCount;
+    if ((h->biSize != 40 && h->biSize != 108 && h->biSize != 124) || h->biSize > size || h->biPlanes != 1 ||
+        h->biWidth <= 0 || h->biWidth > 32768 || height <= 0 || height > 32768 ||
+        (bits != 1 && bits != 4 && bits != 8 && bits != 16 && bits != 24 && bits != 32))
+        return FALSE;
+    if (h->biCompression != BI_RGB && h->biCompression != BI_BITFIELDS) return FALSE; /* no JPEG/PNG/RLE inside */
+    unsigned long long colours = h->biClrUsed ? h->biClrUsed : bits <= 8 ? 1u << bits : 0;
+    unsigned long long need = h->biSize + colours * 4 + (h->biCompression == BI_BITFIELDS && h->biSize == 40 ? 12 : 0) +
+                              ((unsigned long long)h->biWidth * bits + 31) / 32 * 4 * height;
+    return colours <= 256 && need <= size;
 }

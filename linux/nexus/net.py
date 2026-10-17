@@ -10,6 +10,20 @@ import time
 
 from . import link
 
+def arp_mac(ip: str) -> str:
+    """The MAC the kernel's neighbour table has for ip ("aa-bb-.."), else "": for Wake-on-LAN. Read from
+    /proc/net/arp, a fixed kernel format, never from "arp -a" text, which changes with the language."""
+    try:
+        with open("/proc/net/arp") as f:
+            for line in f.readlines()[1:]:
+                cols = line.split()
+                if len(cols) >= 4 and cols[0] == ip and cols[3] != "00:00:00:00:00:00":
+                    return cols[3].replace(":", "-").lower()
+    except OSError:
+        pass
+    return ""
+
+
 # The same numbers as the Windows NS_* states, so test output reads the same on both.
 SETUP, WAITING, CONNECTING, UNREACHABLE, PASSWORD, VERSION, ROLE, PEER, PORT, CONNECTED = range(10)
 
@@ -23,6 +37,10 @@ class Session:
         self.peer = ""
         self.peer_version = ""
         self.rtt, self.audio_state = None, 0  # the Qt thread's, about this peer
+        self.secret = False  # forward secret (both ends 0.5+)
+        self.mac = ""  # learnt after a connection, for Wake-on-LAN
+        self.heard = 0.0  # when the last frame came in (time.monotonic)
+        self.beat = False  # set while input is across: ping every 250 ms instead of every second
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._gen = 0
@@ -66,10 +84,21 @@ class Session:
             self.on_status(status)
 
     def _ping(self) -> None:
+        tick = 0
         while True:
-            time.sleep(1)
-            if self.link:
+            time.sleep(0.25)
+            tick += 1
+            if self.link and (self.beat or tick % 4 == 0):
                 self.send(bytes([link.PING]) + (int(time.monotonic() * 1000) & 0xFFFFFFFF).to_bytes(4, "little"))
+
+    def drop(self) -> None:
+        """The link went silent: close it, and this thread connects again."""
+        with self._lock:
+            if self._sock:
+                try:
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
     def _wait(self, seconds: float) -> None:
         self._wake.wait(seconds)
@@ -148,11 +177,18 @@ class Session:
         except OSError:
             sock.close()
             return UNREACHABLE if cfg.role == "main" else 0
-        self.peer, self.peer_version, self.link = ln.peer, ln.peer_version, ln
+        self.peer, self.peer_version, self.secret, self.link = ln.peer, ln.peer_version, ln.forward_secret, ln
+        self.heard = time.monotonic()
+        if cfg.role == "main":
+            try:
+                self.mac = arp_mac(sock.getpeername()[0]) or self.mac
+            except OSError:
+                pass
         self._set_status(CONNECTED)
         try:
             while True:
                 msg = ln.recv()
+                self.heard = time.monotonic()
                 kind = msg[0]
                 if kind == link.PING and len(msg) == 5:
                     self.send(bytes([link.PONG]) + msg[1:])

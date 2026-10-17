@@ -3,6 +3,9 @@
 role = main | controlled, peer..peer4 = the controlled PCs' addresses, place..place4 = "x,y", each
 one's cell on the 5 x 3 map around this PC (0,0), key = the stretched shared password (64 hex
 digits), never the password itself. Before 0.3, edge = left | right | top | bottom placed the one peer.
+0.5: resistance = px of push before an edge gives (0: at a touch), switch_key = the Windows virtual key
+of the switch key, switch_style = tap | hold, jump..jump4 = modifiers << 8 | virtual key going straight
+to that PC, mac..mac4 = its MAC for Wake-on-LAN.
 """
 
 import configparser
@@ -16,6 +19,10 @@ THIS_PC = MAX_PEERS  # this PC, where a PC number goes
 MAP_W, MAP_H = 5, 3
 PEER_KEYS = ("peer", "peer2", "peer3", "peer4")
 PLACE_KEYS = ("place", "place2", "place3", "place4")
+MAC_KEYS = ("mac", "mac2", "mac3", "mac4")
+JUMP_KEYS = ("jump", "jump2", "jump3", "jump4")
+DEFAULT_RESISTANCE = 120
+VK_RCONTROL = 0xA3
 FREE_CELLS = ((1, 0), (-1, 0), (0, -1), (0, 1), (2, 0), (-2, 0), (1, -1), (1, 1),
               (-1, -1), (-1, 1), (2, -1), (2, 1), (-2, -1), (-2, 1))
 
@@ -35,6 +42,11 @@ class Config:
     peers: list = field(default_factory=lambda: [""] * MAX_PEERS)
     places: list = field(default_factory=lambda: [(0, 0)] * MAX_PEERS)
     key: bytes = b""
+    resistance: int = DEFAULT_RESISTANCE
+    switch_key: int = VK_RCONTROL
+    switch_style: str = "tap"
+    jumps: list = field(default_factory=lambda: [0] * MAX_PEERS)
+    macs: list = field(default_factory=lambda: [""] * MAX_PEERS)
 
     @classmethod
     def load(cls, test: bool = False) -> "Config":
@@ -50,6 +62,19 @@ class Config:
         role = section.get("role", "main")
         cfg = cls(path=path, role=role if role in ("main", "controlled") else "main", key=key_bytes)
         edge = section.get("edge", "right")
+
+        def number(name, default, low, high):
+            try:
+                return max(low, min(high, int(section.get(name, default))))
+            except ValueError:
+                return default
+        cfg.resistance = number("resistance", DEFAULT_RESISTANCE, 0, 1020)
+        cfg.switch_key = number("switch_key", VK_RCONTROL, 1, 255)
+        cfg.switch_style = "hold" if section.get("switch_style", "tap") == "hold" else "tap"
+        for i in range(MAX_PEERS):
+            cfg.jumps[i] = number(JUMP_KEYS[i], 0, 0, 0xFFFF)
+            mac = section.get(MAC_KEYS[i], "").lower()
+            cfg.macs[i] = mac if len(mac) == 17 and all(c in "0123456789abcdef-" for c in mac) else ""
         for i in range(MAX_PEERS):
             cfg.peers[i] = section.get(PEER_KEYS[i], "").strip()
             place = section.get(PLACE_KEYS[i], "")
@@ -71,6 +96,11 @@ class Config:
             if self.peers[i]:
                 values[PEER_KEYS[i]] = self.peers[i]
                 values[PLACE_KEYS[i]] = "%d,%d" % self.places[i]
+                if self.macs[i]:
+                    values[MAC_KEYS[i]] = self.macs[i]
+                if self.jumps[i]:
+                    values[JUMP_KEYS[i]] = str(self.jumps[i])
+        values.update(resistance=str(self.resistance), switch_key=str(self.switch_key), switch_style=self.switch_style)
         values["key"] = self.key.hex()
         parser["nexus"] = values
         tmp = self.path + ".tmp"
@@ -128,4 +158,8 @@ if __name__ == "__main__":  # self-check: python -m nexus.config
     assert not c.move(0, 0, 0) and not c.move(0, 3, 0)
     c.save()
     assert Config.load(True).places == c.places
+    c.resistance, c.switch_style, c.jumps[0], c.macs[0] = 60, "hold", 0x0370, "0a-1b-2c-3d-4e-5f"
+    c.save()
+    d = Config.load(True)
+    assert (d.resistance, d.switch_style, d.jumps[0], d.macs[0]) == (60, "hold", 0x0370, "0a-1b-2c-3d-4e-5f")
     print("config ok")

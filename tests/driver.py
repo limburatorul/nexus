@@ -4,6 +4,7 @@
     python tests/driver.py ini main <controlled IP> # writes build/test/test.ini for a main PC
     python tests/driver.py ini controlled           # ... for a controlled PC
     python tests/driver.py run <main IP> <controlled IP>
+    python tests/driver.py beat <main IP> <controlled IP> <controlled VM name>  # freezes the VM for a moment
 
 Each test instance reads %APPDATA%\\Nexus\\test.ini (~/.config/nexus/test.ini on Linux), links on port
 24810 and takes commands on 24811, authenticated with the same key, so it runs beside a normal Nexus
@@ -41,7 +42,7 @@ class Machine:
                 return msg[1:].decode("utf-8", "replace")
 
     def status(self) -> dict:
-        fields = self("status").split(" ", 8)
+        fields = self("status").split(" ", 9)
         return dict(f.split("=", 1) for f in fields)
 
 
@@ -96,7 +97,55 @@ def run(main_host: str, controlled_host: str) -> None:
         received = got[len("files:"):].split("|")[0]
         assert receiver("fnv " + received) == sent, (receiver("fnv " + received), sent)
         print("ok  file %s -> %s (%s)" % (sender.name, receiver.name, received))
+    if all(m.status()["version"] >= "0.5" for m in (main, ctrl)):
+        run5(main, ctrl)
     print("all passed")
+
+
+def run5(main, ctrl) -> None:
+    """0.5: forward secrecy, text over 64 KB and a picture, both ways."""
+    assert main.status()["secret"] == "1" and ctrl.status()["secret"] == "1", (main("status"), ctrl("status"))
+    print("ok  the link is forward secret on both ends")
+    main("home")
+    time.sleep(1)
+    for what, make, read, label in (("clip-big 200000", "clip-big 200000", "clip-hash", "200 KB of text"),
+                                    ("clip-image 640 480", "clip-image 640 480", "clip-image-get", "a 640x480 picture")):
+        for sender, receiver, going in ((main, ctrl, "cross"), (ctrl, main, "home")):
+            if going == "home":
+                main("cross")  # input has to be over there before it can come home
+                time.sleep(1)
+            assert sender(make) == "ok", what
+            want = sender(read)
+            assert want != "none", (what, want)
+            time.sleep(1)
+            main(going)
+            until("%s on %s" % (label, receiver.name), lambda: receiver(read) == want, 20)
+            print("ok  %s %s -> %s (%s)" % (label, sender.name, receiver.name, want))
+            if going == "cross":
+                main("home")
+                time.sleep(1)
+
+
+def beat(main_host: str, controlled_host: str, vm: str) -> None:
+    """0.5's dead-link detection: input on a controlled VM, the VM frozen (VBoxManage pause), input must be
+    home within ~2 s instead of 6, and the link back once the VM runs again."""
+    import subprocess
+    vbox = os.path.join(os.environ.get("VBOX_MSI_INSTALL_PATH", r"C:\Program Files\Oracle\VirtualBox"), "VBoxManage.exe")
+    main, ctrl = Machine(main_host), Machine(controlled_host)
+    until("connected", lambda: main.status()["status"] == "9", 30)
+    main("cross")
+    until("input over there", lambda: "active=1" in ctrl("status"), 5)
+    subprocess.run([vbox, "controlvm", vm, "pause"], check=True)
+    start = time.time()
+    try:
+        until("input home", lambda: main.status()["remote"] == "0", 10)
+        took = time.time() - start
+    finally:
+        subprocess.run([vbox, "controlvm", vm, "resume"], check=True)
+    assert took < 3.5, took
+    print("ok  frozen controlled PC: input home after %.1f s" % took)
+    until("connected again", lambda: main.status()["status"] == "9", 30)
+    print("ok  link back after the VM resumed")
 
 
 def main_cli() -> None:
@@ -114,6 +163,8 @@ def main_cli() -> None:
         print("build/test/test.ini: %s %s" % (role, peer))
     elif cmd == "run":
         run(sys.argv[2], sys.argv[3])
+    elif cmd == "beat":
+        beat(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
         print(__doc__)
 
