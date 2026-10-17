@@ -44,13 +44,13 @@ STATUS_NOTE = [
     "Another program uses port 24800, so the main PC cannot connect to this one.",
     ""]
 PAGES = [
-    ("Overview", "The PCs this one works with, where input is right now, and how the links are doing.", "MACHINES"),
+    ("Overview", "The PCs this one works with, where input is right now, and how the links are doing.", "Machines"),
     ("Crossing", "Where the PCs stand around this screen. Push the pointer through an edge to cross to the PC "
-                 "beside it, and on from there to the next one.", "MAP"),
-    ("Keyboard", "Switch without the mouse, and a way home that always works.", "SHORTCUTS"),
-    ("Sound", "The controlled PC's sound, played on this PC's speakers.", "SOUND"),
-    ("Files", "Copy files on one PC, switch, and paste them on another.", "FILES"),
-    ("Connection", "This PC's role, the password all the PCs share, and where to find the others.", "THIS PC"),
+                 "beside it, and on from there to the next one.", "Map"),
+    ("Keyboard", "Switch without the mouse, and a way home that always works.", "Shortcuts"),
+    ("Sound", "The controlled PC's sound, played on this PC's speakers.", "Sound"),
+    ("Files", "Copy files on one PC, switch, and paste them on another.", "Files"),
+    ("Connection", "This PC's role, the password all the PCs share, and where to find the others.", "This PC"),
 ]
 
 
@@ -425,33 +425,62 @@ class Controller(QObject):
 # ---- the window ----
 
 def page_icon(page: int, color: str, size: int = 24) -> QIcon:
-    """The Windows app's line icons, drawn the same way in a 24-unit box."""
+    """The Windows app's line icons, drawn the same way in a 24-unit box, round-capped."""
     pix = QPixmap(size * 2, size * 2)
     pix.setDevicePixelRatio(2)
     pix.fill(Qt.transparent)
     p = QPainter(pix)
     p.setRenderHint(QPainter.Antialiasing)
-    p.setPen(QPen(QColor(color), 1.6))
+    p.setPen(QPen(QColor(color), 1.75, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    line = lambda *pts: p.drawPolyline([QPointF(*q) for q in pts])  # noqa: E731
     if page == 0:
-        p.drawRect(2, 4, 15, 11), p.drawLine(9, 15, 9, 19), p.drawLine(5, 19, 13, 19), p.drawRect(14, 10, 9, 10)
+        p.drawRoundedRect(QRectF(2, 4, 14, 11), 2, 2), line((9, 15), (9, 19)), line((6, 19), (12, 19))
+        p.drawRoundedRect(QRectF(14, 10, 8, 10), 2, 2)
     elif page == 1:
-        p.drawPolyline([QPointF(*q) for q in ((3, 8), (21, 8), (17, 4))])
-        p.drawPolyline([QPointF(*q) for q in ((21, 16), (3, 16), (7, 20))])
+        line((3, 8), (21, 8)), line((17, 4), (21, 8), (17, 12))
+        line((21, 16), (3, 16)), line((7, 12), (3, 16), (7, 20))
     elif page == 2:
-        p.drawRoundedRect(QRectF(1, 5, 22, 14), 2, 2)
+        p.drawRoundedRect(QRectF(2, 5, 20, 14), 2.5, 2.5)
+        p.setBrush(QColor(color))
         for i in range(5):
-            p.drawPoint(5 + 3 * i, 9)
-        p.drawLine(7, 15, 17, 15)
+            p.drawEllipse(QRectF(5 + 3.5 * i, 8.5, 2, 2))
+        line((8, 15), (16, 15))
     elif page == 3:
-        p.drawPolygon([QPointF(*q) for q in ((3, 9), (7, 9), (12, 4), (12, 20), (7, 15), (3, 15))])
-        p.drawArc(QRectF(10, 7, 10, 10), -60 * 16, 120 * 16)
-        p.drawArc(QRectF(11, 3, 13, 18), -60 * 16, 120 * 16)
+        line((3, 9), (7, 9), (12, 4), (12, 20), (7, 15), (3, 15), (3, 9))
+        p.drawArc(QRectF(11, 8, 8, 8), -60 * 16, 120 * 16)
+        p.drawArc(QRectF(10, 4, 14, 16), -65 * 16, 130 * 16)
     elif page == 4:
-        p.drawPolygon([QPointF(*q) for q in ((2, 6), (9, 6), (11, 8), (22, 8), (22, 19), (2, 19))])
+        line((3, 6), (10, 6), (12, 9), (22, 9), (22, 18), (2, 18), (2, 7), (3, 6))
     else:
         p.drawEllipse(QRectF(2, 6, 12, 12)), p.drawEllipse(QRectF(10, 6, 12, 12))
     p.end()
     return QIcon(pix)
+
+
+class Light(QWidget):
+    """A status light: the dot, and a soft halo around it while it is lit (connected)."""
+
+    def __init__(self, size: int):
+        super().__init__()
+        self.size, self.color, self.lit = size, QColor("gray"), False
+        self.setFixedSize(size * 2, size * 2)
+
+    def set(self, color: str, lit: bool) -> None:
+        self.color, self.lit = QColor(color), lit
+        self.update()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        if self.lit:
+            halo = QColor(self.color)
+            halo.setAlpha(48)
+            p.setBrush(halo)
+            p.drawEllipse(QRectF(0, 0, 2 * self.size, 2 * self.size))
+        p.setBrush(self.color)
+        p.drawEllipse(QRectF(self.size / 2, self.size / 2, self.size, self.size))
+        p.end()
 
 
 from PySide6.QtCore import QPointF  # noqa: E402  (used by page_icon)
@@ -495,6 +524,39 @@ class Tile(QPushButton):
         else:
             self._move_to(*self.view.c.cfg.places[self.pc])
 
+    def paintEvent(self, _e) -> None:
+        pal, c = self.view.win.p, self.view.c
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        hover = self.underMouse() or self._grab is not None
+        p.setPen(QPen(QColor(pal["signal"] if self.hasFocus() else pal["ink2"] if hover else pal["edge"]),
+                      2 if self.hasFocus() else 1))
+        p.setBrush(QColor(pal["rule"] if hover else pal["well"]))
+        p.drawRoundedRect(r, 10, 10)
+        state = c.state[self.pc]
+        color = QColor(self.view.win._status_color(state))
+        if state == net.CONNECTED:
+            halo = QColor(color)
+            halo.setAlpha(48)
+            p.setPen(Qt.NoPen), p.setBrush(halo), p.drawEllipse(QRectF(9, 12, 16, 16))
+        p.setPen(Qt.NoPen), p.setBrush(color), p.drawEllipse(QRectF(13, 16, 8, 8))
+        f = p.font()
+        f.setWeight(QFont.DemiBold)
+        p.setFont(f)
+        p.setPen(QColor(pal["ink"]))
+        name = p.fontMetrics().elidedText(c.name_of(self.pc), Qt.ElideRight, self.width() - 36)
+        p.drawText(QRectF(28, 8, self.width() - 32, 22), Qt.AlignLeft | Qt.AlignVCenter, name)
+        f.setWeight(QFont.Normal)
+        f.setPixelSize(13)
+        p.setFont(f)
+        p.setPen(QColor(pal["ink3"]))
+        known = c.sessions[self.pc].peer  # with no name yet, the address is the name and the state goes here
+        sub = c.cfg.peers[self.pc] if known else STATUS_WORD[state]
+        p.drawText(QRectF(12, 30, self.width() - 20, 20), Qt.AlignLeft | Qt.AlignVCenter,
+                   p.fontMetrics().elidedText(sub, Qt.ElideRight, self.width() - 20))
+        p.end()
+
     def keyPressEvent(self, e) -> None:
         step = self.ARROWS.get(e.key())
         if not step:
@@ -532,14 +594,23 @@ class MapView(QWidget):
                 x, y = cx - MAP_W // 2, cy - MAP_H // 2
                 r = QRectF(self.cell_rect(x, y))
                 if (x, y) == (0, 0):
-                    p.setPen(QPen(QColor(pal["ink"]), 1.5))
+                    p.setPen(QPen(QColor(pal["signal"]), 2))
                     p.setBrush(QColor(pal["well"]))
-                    p.drawRoundedRect(r, 5, 5)
-                    p.drawText(r, Qt.AlignCenter, "This PC")
+                    p.drawRoundedRect(r.adjusted(1, 1, -1, -1), 10, 10)
+                    f = p.font()
+                    f.setWeight(QFont.DemiBold)
+                    p.setFont(f)
+                    p.setPen(QColor(pal["ink"]))
+                    p.drawText(r.adjusted(12, 8, -8, 0), Qt.AlignLeft | Qt.AlignTop, "This PC")
+                    f.setWeight(QFont.Normal)
+                    f.setPixelSize(13)
+                    p.setFont(f)
+                    p.setPen(QColor(pal["ink3"]))
+                    p.drawText(r.adjusted(12, 30, -8, 0), Qt.AlignLeft | Qt.AlignTop, socket.gethostname())
                 else:
-                    p.setPen(QPen(QColor(pal["rule"]), 1, Qt.DashLine))
+                    p.setPen(QPen(QColor(pal["rule"]), 1))
                     p.setBrush(Qt.NoBrush)
-                    p.drawRoundedRect(r, 5, 5)
+                    p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 10, 10)
         p.end()
 
 
@@ -549,6 +620,7 @@ class Window(QWidget):
         self.c = c
         self.page = 0
         self.focus_tile = None  # the map tile the arrow keys moved, focused again once rebuilt
+        self.setObjectName("root")
         self.setWindowTitle("Nexus (test)" if c.test else "Nexus")
         self.setWindowIcon(QIcon(os.path.join(RES, "nexus.ico")))
         self.setMinimumSize(760, 640)
@@ -562,7 +634,8 @@ class Window(QWidget):
     def _style(self) -> str:
         p = self.p
         return f"""
-        QWidget {{ background: {p['ground']}; color: {p['ink']}; font-family: 'Hanken Grotesk'; font-size: 14px; }}
+        QWidget {{ color: {p['ink']}; font-family: 'Hanken Grotesk'; font-size: 14px; }}
+        #root, #content {{ background: {p['ground']}; }}
         #sidebar {{ border-right: 1px solid {p['rule']}; }}
         #status {{ border-bottom: 1px solid {p['rule']}; }}
         #footer {{ border-top: 1px solid {p['rule']}; }}
@@ -570,26 +643,25 @@ class Window(QWidget):
         QLabel#title {{ font-size: 28px; font-weight: 700; }}
         QLabel#desc, QLabel#body {{ color: {p['ink2']}; }}
         QLabel#small {{ color: {p['ink3']}; font-size: 13px; }}
-        QLabel#eyebrow {{ color: {p['ink3']}; font-size: 11px; font-weight: 600; letter-spacing: 1.5px; }}
+        QLabel#eyebrow {{ color: {p['ink']}; font-size: 16px; font-weight: 600; }}
         QLabel#line {{ font-weight: 600; font-size: 15px; }}
-        QLabel#keycap {{ background: {p['well']}; border: 1px solid {p['edge']}; border-radius: 6px;
+        QLabel#keycap {{ background: {p['well']}; border: 1px solid {p['edge']}; border-radius: 8px;
                          font-family: 'B612 Mono'; font-size: 13px; padding: 10px 18px; }}
-        #module {{ background: {p['panel']}; }}
-        #module QWidget {{ background: {p['panel']}; }}
-        QPushButton {{ background: transparent; border: 1px solid {p['edge']}; border-radius: 5px; padding: 10px 18px;
+        #module {{ background: {p['panel']}; border: 1px solid {p['rule']}; border-radius: 12px; }}
+        QPushButton {{ background: transparent; border: 1px solid {p['edge']}; border-radius: 8px; padding: 10px 18px;
                        font-weight: 600; color: {p['ink']}; }}
         QPushButton:hover {{ background: {p['well']}; border-color: {p['ink2']}; }}
         QPushButton:checked {{ background: {p['ink']}; color: {p['ground']}; border-color: {p['ink']}; }}
         QPushButton:focus {{ outline: none; border: 2px solid {p['signal']}; }}
         QPushButton#nav {{ border: none; text-align: left; padding: 14px 16px; font-weight: 400; font-size: 15px;
-                           color: {p['ink2']}; border-left: 3px solid transparent; border-radius: 6px; }}
+                           color: {p['ink2']}; border-left: 3px solid transparent; border-radius: 8px; }}
         QPushButton#nav:hover {{ background: {p['panel']}; color: {p['ink']}; }}
         QPushButton#nav:checked {{ background: {p['well']}; color: {p['ink']}; font-weight: 600;
                                    border-left: 3px solid {p['signal']}; }}
         QPushButton#link {{ border: none; text-align: left; padding: 4px 0; font-weight: 400; color: {p['ink3']};
                             font-size: 13px; }}
         QPushButton#link:hover {{ color: {p['ink']}; background: transparent; }}
-        QLineEdit {{ background: {p['well']}; border: 1px solid {p['edge']}; border-radius: 4px; padding: 10px 12px; }}
+        QLineEdit {{ background: {p['well']}; border: 1px solid {p['edge']}; border-radius: 8px; padding: 10px 12px; }}
         QLineEdit:focus {{ border-color: {p['signal']}; }}
         QScrollArea {{ border: none; }}
         """
@@ -618,11 +690,10 @@ class Window(QWidget):
         stl = QVBoxLayout(status)
         stl.setContentsMargins(28, 28, 16, 18)
         row = QHBoxLayout()
-        self.dot = QLabel()
-        self.dot.setFixedSize(12, 12)
+        self.dot = Light(12)
         self.line = self._label(name="line", wrap=False)
         row.addWidget(self.dot)
-        row.addSpacing(12)
+        row.addSpacing(6)
         row.addWidget(self.line, 1)
         stl.addLayout(row)
         self.who = self._label(wrap=False)
@@ -655,7 +726,7 @@ class Window(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self.content = QWidget()
+        self.content = QWidget(objectName="content")
         scroll.setWidget(self.content)
         top.addWidget(scroll, 1)
 
@@ -699,7 +770,7 @@ class Window(QWidget):
                 " Push the pointer through an edge that has a PC beside it on the Crossing page to cross."
         else:
             line, note = "Connected", "Connected to %s, the main PC." % peer
-        self.dot.setStyleSheet("background: %s; border-radius: 6px;" % self._status_color())
+        self.dot.set(self._status_color(), c.status == net.CONNECTED)
         self.line.setText(line)
         if c.cfg.role == "main":
             who = peer if pc >= 0 else next((a for a in c.cfg.peers if a), "")
@@ -730,7 +801,7 @@ class Window(QWidget):
         lay.setContentsMargins(40, 40, 40, 28)
         lay.setSpacing(0)
         name, desc, eyebrow = PAGES[self.page]
-        lay.addWidget(self._label(name.upper(), "title", wrap=False))
+        lay.addWidget(self._label(name, "title", wrap=False))
         lay.addSpacing(14)
         lay.addWidget(self._label(desc, "desc"))
         lay.addSpacing(28)
@@ -751,11 +822,10 @@ class Window(QWidget):
                     if main and not c.cfg.peers[i] or not main and i:
                         continue
                     row = QHBoxLayout()
-                    dot = QLabel()
-                    dot.setFixedSize(10, 10)
-                    dot.setStyleSheet("background: %s; border-radius: 5px;" % self._status_color(c.state[i]))
+                    dot = Light(10)
+                    dot.set(self._status_color(c.state[i]), c.state[i] == net.CONNECTED)
                     row.addWidget(dot)
-                    row.addSpacing(12)
+                    row.addSpacing(6)
                     row.addWidget(self._label(c.name_of(i) if main or c.up(i) else "Main PC", "line"), 1)
                     m.addLayout(row)
                     m.addWidget(self._label("Controlled PC  ·  %s  ·  %s" % (c.cfg.peers[i], STATUS_WORD[c.state[i]])
