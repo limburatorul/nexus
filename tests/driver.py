@@ -7,7 +7,7 @@
     python tests/driver.py edge <main IP> <controlled IP> [its number]  # resistance and corners there
     python tests/driver.py beat <main IP> <controlled IP> <controlled VM name>  # freezes the VM for a moment
 
-Each test instance reads %APPDATA%\\Nexus\\test.ini (~/.config/nexus/test.ini on Linux), links on port
+Each test instance reads %APPDATA%\\ProtagonistLabs\\Nexus\\test.ini (~/.config/nexus/test.ini on Linux), links on port
 24810 and takes commands on 24811, authenticated with the same key, so it runs beside a normal Nexus
 and never touches this PC's mouse and keyboard.
 """

@@ -36,7 +36,7 @@ PC-ului principal, iar cursorul trece din unul în altul ca între monitoarele a
 - **Wake-on-LAN** pentru PC-urile controlate adormite.
 - **Forward secrecy:** fiecare conexiune între două PC-uri 0.5 are și chei X25519 efemere, deci o parolă aflată mai
   târziu nu deschide o sesiune înregistrată. Cu un PC 0.4 legătura merge în continuare (și update-ul automat).
-- **Log** în `%APPDATA%\Nexus\nexus.log` (Linux: `~/.config/nexus/nexus.log`) și `crash.log`; atașează-le la un
+- **Log** în `%APPDATA%\ProtagonistLabs\Nexus\nexus.log` (Linux: `~/.config/nexus/nexus.log`) și `crash.log`; atașează-le la un
   bug report. Pagina de setări are acum scroll.
 
 ## Sisteme suportate

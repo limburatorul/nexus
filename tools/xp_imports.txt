@@ -346,3 +346,4 @@ user32.dll!drawiconex
 comctl32.dll!initcommoncontrols
 gdiplus.dll!gdipaddpathline
 kernel32.dll!getsystemtime
+kernel32.dll!movefilew

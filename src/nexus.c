@@ -245,9 +245,24 @@ static void free_cell(int pc)
 
 static void config_load(void)
 {
-    wchar_t v[128];
+    wchar_t v[128], old[MAX_PATH], old_ini[MAX_PATH];
     SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, g.ini);
+    _snwprintf(old, MAX_PATH, L"%ls\\Nexus", g.ini);
+    old[MAX_PATH - 1] = 0;
+    wcscat(g.ini, L"\\ProtagonistLabs");
+    CreateDirectoryW(g.ini, NULL);
     wcscat(g.ini, L"\\Nexus");
+    /* The studio's one data folder, since 0.6.1. The folder moves whole unless something in it is open (the
+     * updating installer runs from there); then the settings move alone and the old logs stay behind. */
+    _snwprintf(old_ini, MAX_PATH, L"%ls\\nexus.ini", old);
+    old_ini[MAX_PATH - 1] = 0;
+    if (!g.test && GetFileAttributesW(old_ini) != INVALID_FILE_ATTRIBUTES && !MoveFileW(old, g.ini)) {
+        wchar_t new_ini[MAX_PATH];
+        CreateDirectoryW(g.ini, NULL);
+        _snwprintf(new_ini, MAX_PATH, L"%ls\\nexus.ini", g.ini);
+        new_ini[MAX_PATH - 1] = 0;
+        MoveFileW(old_ini, new_ini); /* refused when the new folder has its own settings: those stay */
+    }
     CreateDirectoryW(g.ini, NULL);
     wcscat(g.ini, g.test ? L"\\test.ini" : L"\\nexus.ini");
 

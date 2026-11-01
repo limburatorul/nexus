@@ -2,10 +2,12 @@
 Unicode true
 !include "MUI2.nsh"
 !include "WinVer.nsh"
+!include "x64.nsh"
 
 Name "Nexus"
 OutFile "..\build\Nexus-Setup-${VERSION}.exe"
-InstallDir "$PROGRAMFILES\Nexus"
+; The studio's one folder for programs. This 32-bit installer sets the 64-bit one in .onInit.
+InstallDir "$PROGRAMFILES\ProtagonistLabs\Nexus"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
 BrandingText "Nexus ${VERSION}"
@@ -30,9 +32,28 @@ BrandingText "Nexus ${VERSION}"
   Sleep 1000
 !macroend
 
+Function .onInit
+  ${If} ${RunningX64}
+  ${AndIf} $INSTDIR == "$PROGRAMFILES\ProtagonistLabs\Nexus"
+    StrCpy $INSTDIR "$PROGRAMFILES64\ProtagonistLabs\Nexus"
+  ${EndIf}
+FunctionEnd
+
 Section "Nexus"
   !insertmacro CloseNexus
   SetShellVarContext all
+  ; Before 0.6.1 Nexus lived in its own folder; the shortcut, autostart and uninstall entries below are simply rewritten.
+  ${If} ${FileExists} "$PROGRAMFILES\Nexus\nexus.exe"
+    ${IfNot} ${AtLeastWinVista}
+      nsExec::Exec 'netsh firewall delete allowedprogram program="$PROGRAMFILES\Nexus\nexus.exe"'
+    ${EndIf}
+    Delete "$PROGRAMFILES\Nexus\nexus.exe"
+    Delete "$PROGRAMFILES\Nexus\LICENSE"
+    Delete "$PROGRAMFILES\Nexus\HankenGrotesk-OFL.txt"
+    Delete "$PROGRAMFILES\Nexus\B612Mono-OFL.txt"
+    Delete "$PROGRAMFILES\Nexus\uninstall.exe"
+    RMDir "$PROGRAMFILES\Nexus"
+  ${EndIf}
   SetOutPath "$INSTDIR"
   File "..\build\nexus.exe"
   File "..\LICENSE"
@@ -60,7 +81,7 @@ Section "Nexus"
 
   WriteRegStr HKLM "${UNINST}" "DisplayName" "Nexus"
   WriteRegStr HKLM "${UNINST}" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKLM "${UNINST}" "Publisher" "Nexus"
+  WriteRegStr HKLM "${UNINST}" "Publisher" "Protagonist Labs"
   WriteRegStr HKLM "${UNINST}" "DisplayIcon" "$INSTDIR\nexus.exe"
   WriteRegStr HKLM "${UNINST}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegDWORD HKLM "${UNINST}" "NoModify" 1
@@ -89,5 +110,9 @@ Section "Uninstall"
   Delete "$INSTDIR\HankenGrotesk-OFL.txt"
   Delete "$INSTDIR\B612Mono-OFL.txt"
   Delete "$INSTDIR\uninstall.exe"
+  SetOutPath "$TEMP" ; out of the folder, so it can go
   RMDir "$INSTDIR"
+  RMDir "$INSTDIR\.." ; the studio's folder, when this was the last app in it
+  SetShellVarContext current
+  Delete "$APPDATA\ProtagonistLabs\apps\nexus.json" ; so the other apps stop listing it; settings and logs stay
 SectionEnd

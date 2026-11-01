@@ -1,5 +1,5 @@
 /* Releases are GitHub releases tagged vX.Y.Z with Nexus-Setup-X.Y.Z.exe attached. The main PC reads
- * the latest one over HTTPS (WinHTTP), downloads a newer installer into %APPDATA%\Nexus\updates
+ * the latest one over HTTPS (WinHTTP), downloads a newer installer into %APPDATA%\ProtagonistLabs\Nexus\updates
  * and keeps it, so a controlled PC that connects later with an older Nexus can be sent the same
  * file: UPDATE_BEGIN [size u32][version], UPDATE_DATA chunks, UPDATE_END. The controlled PC only
  * runs a newer version, and only a complete file that starts like a Windows program. */
@@ -49,7 +49,7 @@ BOOL update_installer(const char *version, wchar_t path[MAX_PATH])
 {
     wchar_t dir[MAX_PATH];
     if (!valid_version(version) || SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, dir) != S_OK) return FALSE;
-    _snwprintf(path, MAX_PATH, L"%ls\\Nexus\\updates\\Nexus-Setup-%hs.exe", dir, version);
+    _snwprintf(path, MAX_PATH, L"%ls\\ProtagonistLabs\\Nexus\\updates\\Nexus-Setup-%hs.exe", dir, version);
     path[MAX_PATH - 1] = 0;
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
@@ -132,7 +132,10 @@ static void check(void)
                     lstrcpynW(dir, path, MAX_PATH);
                     *wcsrchr(dir, L'\\') = 0;
                     *wcsrchr(dir, L'\\') = 0;
-                    CreateDirectoryW(dir, NULL); /* %APPDATA%\Nexus, in case the config was never saved */
+                    *wcsrchr(dir, L'\\') = 0;
+                    CreateDirectoryW(dir, NULL); /* ...\ProtagonistLabs and its Nexus, in case the config was never saved */
+                    wcscat(dir, L"\\Nexus");
+                    CreateDirectoryW(dir, NULL);
                     wcscat(dir, L"\\updates");
                     CreateDirectoryW(dir, NULL);
                     _snwprintf(part, MAX_PATH, L"%ls.part", path);
