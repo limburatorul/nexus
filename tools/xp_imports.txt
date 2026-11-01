@@ -342,3 +342,7 @@ user32.dll!setsystemcursor
 user32.dll!setwindowrgn
 user32.dll!systemparametersinfow
 ws2_32.dll!getpeername
+user32.dll!drawiconex
+comctl32.dll!initcommoncontrols
+gdiplus.dll!gdipaddpathline
+kernel32.dll!getsystemtime

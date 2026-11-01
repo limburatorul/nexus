@@ -5,6 +5,7 @@
 #include "link.h" /* winsock2.h has to come before windows.h */
 #include <shellapi.h>
 #include <shlobj.h>
+#include <commctrl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@
 #define WIDEN2(s) L##s
 #define WIDEN(s) WIDEN2(s)
 #define SITE_URL L"https://github.com/limburatorul/nexus"
+#define PIZZA_URL L"https://buymeacoffee.com/protagonistlabs"
 
 #define WM_TRAY (WM_APP + 1)
 #define WM_NEXUS_QUIT (WM_APP + 2) /* sent by the installer before it overwrites the exe */
@@ -50,7 +52,7 @@ enum { ID_TRAY_OPEN = 1, ID_TRAY_QUIT, ID_TRAY_SEND, ID_TRAY_PAUSE, ID_TRAY_LOGS
        ID_ADDR0, ID_ADDR3 = ID_ADDR0 + MAX_PEERS - 1, ID_ADDR_LABEL0, ID_ADDR_LABEL3 = ID_ADDR_LABEL0 + MAX_PEERS - 1,
        ID_TILE0, ID_TILE3 = ID_TILE0 + MAX_PEERS - 1,
        ID_RES0, ID_RES3 = ID_RES0 + 3, /* edge resistance: touch, light, normal, firm */
-       ID_PAUSE, ID_FULLSCREEN, ID_HIDE_POINTER, ID_LOGS, ID_SWITCH_KEY, ID_STYLE_TAP, ID_STYLE_HOLD,
+       ID_PAUSE, ID_FULLSCREEN, ID_HIDE_POINTER, ID_LOGS, ID_PIZZA, ID_SWITCH_KEY, ID_STYLE_TAP, ID_STYLE_HOLD,
        ID_JUMP0, ID_JUMP3 = ID_JUMP0 + MAX_PEERS - 1, ID_WAKE0, ID_WAKE3 = ID_WAKE0 + MAX_PEERS - 1 };
 enum { K_NAV, K_OUTLINE, K_LINK, K_SEGMENT, K_TILE, K_TOGGLE };
 static const int RESISTANCE[] = {0, 60, DEFAULT_RESISTANCE, 240}; /* px, for ID_RES0.. */
@@ -129,7 +131,7 @@ enum { L_TEXT, L_LINE, L_DOT, L_WELL, L_KEYCAP, L_CELL, L_HOME }; /* L_CELL, L_H
 static struct {
     HINSTANCE inst;
     HWND found_btn[MAX_FOUND];
-    HWND wnd, hover, nav[NPAGES], quit, site, update, setup, role[2], pw, pw_label;
+    HWND wnd, hover, nav[NPAGES], quit, site, pizza, update, setup, role[2], pw, pw_label;
     HWND addr[MAX_PEERS], addr_label[MAX_PEERS], tile[MAX_PEERS];
     HWND res[4], pause, fullscreen, hide_pointer, logs, switch_key, style[2], jump[MAX_PEERS], wake[MAX_PEERS];
     int scroll, content_h; /* the page column scrolls: how far, and how tall the page is */
@@ -145,7 +147,10 @@ static struct {
     const Palette *p;
     HBRUSH well_brush;
     int dpi, page, body_h;
-    HFONT title, body, nav_font, nav_sel, status_font, eyebrow, button, small, mono;
+    HFONT title, body, nav_font, nav_sel, status_font, eyebrow, button, small, mono, brand;
+    HICON logo;
+    BOOL bar_hot;  /* the pointer is over the page's scroll bar */
+    int bar_grab;  /* dragging its thumb: where in the thumb it was grabbed, -1 for no drag */
     RECT desc_rc, module_rc;
     Label labels[64];
     int nlabels;
@@ -189,12 +194,13 @@ static struct {
 
 static int S(int px) { return MulDiv(px, g.dpi, 96); }
 static void redraw(const RECT *r);
+static BOOL bar_thumb(RECT *r);
 static void test_command(const char *cmd, char *out);
 static void move_peer(int pc, int x, int y);
 static void go_home(void);
 static int cell_w, cell_h; /* a map cell, set by layout() */
 
-static const int SIDEBAR = 280, FOOTER = 96, NAV_H = 52, STATUS_H = 132;
+static const int SIDEBAR = 232, FOOTER = 76, NAV_H = 44, STATUS_H = 148;
 
 /* ---- config ---- */
 
@@ -704,8 +710,9 @@ static void load_fonts(void)
     /* The static SemiBold cut registers as its own legacy family, as Google's static fonts do. */
     g.title = mkfont(L"Hanken Grotesk", 28, FW_BOLD);
     g.body = mkfont(L"Hanken Grotesk", 14, FW_NORMAL);
-    g.nav_font = mkfont(L"Hanken Grotesk", 15, FW_NORMAL);
-    g.nav_sel = mkfont(L"Hanken Grotesk SemiBold", 15, FW_NORMAL);
+    g.nav_font = mkfont(L"Hanken Grotesk", 14, FW_NORMAL);
+    g.nav_sel = mkfont(L"Hanken Grotesk SemiBold", 14, FW_NORMAL);
+    g.brand = mkfont(L"Hanken Grotesk", 19, FW_BOLD);
     g.status_font = mkfont(L"Hanken Grotesk SemiBold", 15, FW_NORMAL);
     g.eyebrow = mkfont(L"Hanken Grotesk SemiBold", 16, FW_NORMAL); /* a card's heading */
     g.button = mkfont(L"Hanken Grotesk SemiBold", 14, FW_NORMAL);
@@ -743,7 +750,11 @@ static void apply_theme(void)
         typedef HRESULT(WINAPI * SetAttr)(HWND, DWORD, LPCVOID, DWORD);
         SetAttr set = (SetAttr)(void *)GetProcAddress(dwm, "DwmSetWindowAttribute");
         BOOL dark = g.p == &DARK;
-        if (set) set(g.wnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
+        if (set) {
+            set(g.wnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof dark);
+            set(g.wnd, 34 /* DWMWA_BORDER_COLOR */, &g.p->ground, sizeof g.p->ground);
+            set(g.wnd, 35 /* DWMWA_CAPTION_COLOR */, &g.p->ground, sizeof g.p->ground);
+        }
         FreeLibrary(dwm);
     }
     redraw(NULL);
@@ -920,6 +931,7 @@ int WINAPI GdipCreatePath(int fill_mode, void **path);
 int WINAPI GdipDeletePath(void *path);
 int WINAPI GdipAddPathArc(void *path, float x, float y, float w, float h, float start, float sweep);
 int WINAPI GdipClosePathFigure(void *path);
+int WINAPI GdipAddPathLine(void *path, float x1, float y1, float x2, float y2);
 int WINAPI GdipFillPath(void *gr, void *brush, void *path);
 int WINAPI GdipDrawPath(void *gr, void *pen, void *path);
 int WINAPI GdipFillEllipse(void *gr, void *brush, float x, float y, float w, float h);
@@ -999,6 +1011,31 @@ static int text_height(HDC dc, const wchar_t *s, int width, HFONT f)
     SelectObject(dc, f);
     DrawTextW(dc, s, -1, &r, DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX);
     return r.bottom;
+}
+
+/* A pizza slice: crust along the top, cheese below it, two slices of pepperoni. */
+static void draw_pizza(HDC dc, int x, int y, int size)
+{
+    float k = size / 16.0f;
+    void *gr = smooth(dc), *cheese = NULL, *meat = NULL, *crust = NULL, *path = NULL;
+    GdipCreateSolidFill(0xFFF2B544, &cheese);
+    GdipCreateSolidFill(0xFFD9482B, &meat);
+    GdipCreatePen1(0xFFB9772A, 2.2f * k, GP_PIXEL, &crust);
+    GdipSetPenStartCap(crust, GP_ROUND);
+    GdipSetPenEndCap(crust, GP_ROUND);
+    GdipCreatePath(0, &path);
+    GdipAddPathLine(path, x + 2 * k, y + 3 * k, x + 14 * k, y + 3 * k);
+    GdipAddPathLine(path, x + 14 * k, y + 3 * k, x + 8 * k, y + 15 * k);
+    GdipClosePathFigure(path);
+    GdipFillPath(gr, cheese, path);
+    GdipFillEllipse(gr, meat, x + 5 * k, y + 5 * k, 2.6f * k, 2.6f * k);
+    GdipFillEllipse(gr, meat, x + 8.6f * k, y + 7 * k, 2.6f * k, 2.6f * k);
+    GdipDrawLine(gr, crust, x + 2 * k, y + 3 * k, x + 14 * k, y + 3 * k);
+    GdipDeletePath(path);
+    GdipDeletePen(crust);
+    GdipDeleteBrush(meat);
+    GdipDeleteBrush(cheese);
+    GdipDeleteGraphics(gr);
 }
 
 static void draw_icon(HDC dc, int page, int x, int y, COLORREF c)
@@ -1117,6 +1154,23 @@ static LRESULT CALLBACK button_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     return CallWindowProcW(g.button_proc, w, m, wp, lp);
 }
 
+/* A hint shown while the pointer rests on a control. */
+static void add_tooltip(HWND control, const wchar_t *hint)
+{
+    static HWND tips;
+    if (!tips) {
+        InitCommonControls();
+        tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP, 0, 0, 0, 0, g.wnd, NULL, g.inst, NULL);
+    }
+    TOOLINFOW t = {0};
+    t.cbSize = TTTOOLINFOW_V1_SIZE; /* the size XP without a manifest understands */
+    t.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    t.hwnd = g.wnd;
+    t.uId = (UINT_PTR)control;
+    t.lpszText = (wchar_t *)hint;
+    SendMessageW(tips, TTM_ADDTOOLW, 0, (LPARAM)&t);
+}
+
 static HWND add_button(const wchar_t *label, int id, int kind)
 {
     HWND b = CreateWindowW(L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, g.wnd,
@@ -1212,10 +1266,14 @@ static void draw_control(const DRAWITEMSTRUCT *d)
             text(dc, label, t, g.button, p->ink, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             SetRect(&t, S(12), S(30), w - S(8), S(50));
             /* Under the name, the address; with no name yet, the address is the name and the state goes here. */
-            text(dc, pp->name[0] ? pp->addr : STATUS_WORD[pp->status], t, g.small, p->ink3,
+            text(dc, pp->name[0] ? pp->addr : pp->status == NS_UNREACHABLE ? L"Offline" : STATUS_WORD[pp->status], t, g.small, p->ink3,
                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         } else {
             COLORREF c = d->CtlID == ID_UPDATE ? p->signal : hover ? p->ink : p->ink3;
+            if (d->CtlID == ID_PIZZA) { /* drawn, as XP has no emoji to put in the label */
+                draw_pizza(dc, 0, (h - S(16)) / 2, S(16));
+                r.left += S(22);
+            }
             text(dc, label, r, d->CtlID == ID_UPDATE ? g.button : g.small, c, DT_SINGLELINE | DT_VCENTER);
         }
         if (focus) {
@@ -1337,26 +1395,27 @@ static void layout_page(void)
 
     RECT c;
     GetClientRect(g.wnd, &c);
-    int top = S(STATUS_H) + S(16);
+    int top = S(STATUS_H) + S(12);
     for (int i = 0; i < NPAGES; i++)
-        MoveWindow(g.nav[i], S(16), top + i * S(NAV_H + 4), S(SIDEBAR - 32), S(NAV_H), TRUE);
+        MoveWindow(g.nav[i], S(16), top + i * S(NAV_H + 2), S(SIDEBAR - 32), S(NAV_H), TRUE);
     int fy = c.bottom - S(FOOTER);
     view_bottom = fy;
     MoveWindow(g.site, S(28), fy - S(44), S(SIDEBAR - 56), S(28), TRUE);
     MoveWindow(g.logs, S(28), fy - S(100), S(SIDEBAR - 56), S(28), TRUE);
+    MoveWindow(g.pizza, S(28), fy - S(130), S(SIDEBAR - 56), S(28), TRUE);
     if (g.update_version[0] && g.cfg.role == ROLE_MAIN && !g.installing) {
         wchar_t label[48];
         _snwprintf(label, 48, L"Install Nexus %hs", g.update_version);
         label[47] = 0;
         SetWindowTextW(g.update, label);
-        place(g.update, S(28), fy - S(136), S(SIDEBAR - 56), S(28));
+        place(g.update, S(28), fy - S(160), S(SIDEBAR - 56), S(28));
     } else {
         ShowWindow(g.update, SW_HIDE);
     }
-    MoveWindow(g.quit, c.right - S(32) - S(190), fy + (S(FOOTER) - S(48)) / 2, S(190), S(48), TRUE);
+    MoveWindow(g.quit, c.right - S(28) - S(140), fy + (S(FOOTER) - S(40)) / 2, S(140), S(40), TRUE);
 
     /* Page column: Beamer's 40px margin, at most 960 wide. */
-    int x0 = S(SIDEBAR) + S(40), width = c.right - x0 - S(40);
+    int x0 = S(SIDEBAR) + S(36), width = c.right - x0 - S(36);
     if (width > S(960)) width = S(960);
     lay_dc = GetDC(g.wnd);
     g.nlabels = 0;
@@ -1617,26 +1676,19 @@ static void layout_page(void)
     ReleaseDC(g.wnd, lay_dc);
     /* The page scrolls when it is taller than the space above the footer. */
     g.content_h = y + S(28) + S(40) + g.scroll;
-    SCROLLINFO si = {sizeof si, SIF_RANGE | SIF_PAGE | SIF_POS, 0, g.content_h - 1, (UINT)max(1, fy), g.scroll, 0};
-    SetScrollInfo(g.wnd, SB_VERT, &si, TRUE);
 }
 
-/* Places everything; showing or hiding the scroll bar changes the width, so then once more. */
+/* Places everything; the page's height is only known after placing it, so a shorter page takes a second pass. */
 static void layout(void)
 {
-    static BOOL busy; /* SetScrollInfo can send WM_SIZE from inside */
-    if (busy) return;
-    busy = TRUE;
-    for (int i = 0; i < 3; i++) {
-        RECT before, after;
-        GetClientRect(g.wnd, &before);
-        int most = max(0, g.content_h - (before.bottom - S(FOOTER)));
+    RECT c;
+    GetClientRect(g.wnd, &c);
+    for (int i = 0; i < 2; i++) {
+        int most = max(0, g.content_h - (c.bottom - S(FOOTER)));
         if (g.scroll > most) g.scroll = most;
         layout_page();
-        GetClientRect(g.wnd, &after);
-        if (after.right == before.right && g.scroll <= max(0, g.content_h - (after.bottom - S(FOOTER)))) break;
+        if (g.scroll <= max(0, g.content_h - (c.bottom - S(FOOTER)))) break;
     }
-    busy = FALSE;
 }
 
 static void scroll_to(int y)
@@ -1648,6 +1700,29 @@ static void scroll_to(int y)
     g.scroll = y;
     layout();
     redraw(NULL);
+}
+
+/* The scroll bar's thumb, in the window's right margin; FALSE when the page fits. */
+static BOOL bar_thumb(RECT *r)
+{
+    RECT c;
+    GetClientRect(g.wnd, &c);
+    int view = c.bottom - S(FOOTER), track = view - S(16);
+    if (g.content_h <= view || track <= 0) return FALSE;
+    int len = max(S(36), MulDiv(track, view, g.content_h));
+    int top = S(8) + MulDiv(track - len, g.scroll, g.content_h - view);
+    SetRect(r, c.right - S(11), top, c.right - S(5), top + len);
+    return TRUE;
+}
+
+/* Dragging: the thumb's top follows the pointer. */
+static void bar_drag(int mouse_y)
+{
+    RECT c, t;
+    if (!bar_thumb(&t)) return;
+    GetClientRect(g.wnd, &c);
+    int view = c.bottom - S(FOOTER), room = view - S(16) - (t.bottom - t.top);
+    if (room > 0) scroll_to(MulDiv(mouse_y - g.bar_grab - S(8), g.content_h - view, room));
 }
 
 /* Tab moved the focus to a control the page has scrolled away. */
@@ -1689,10 +1764,13 @@ static void render(HDC dc, RECT c)
     SetRect(&r, 0, S(STATUS_H), S(SIDEBAR), S(STATUS_H) + 1), fill(dc, &r, p->rule);
 
     /* Status block: where input is and how the link is. */
-    status_light(dc, S(28), S(37), S(12), status_color());
-    SetRect(&r, S(52), S(30), S(SIDEBAR - 16), S(56));
+    DrawIconEx(dc, S(20), S(16), g.logo, S(32), S(32), 0, NULL, DI_NORMAL);
+    SetRect(&r, S(62), S(16), S(SIDEBAR - 16), S(48));
+    text(dc, L"Nexus", r, g.brand, p->ink, DT_SINGLELINE | DT_VCENTER);
+    status_light(dc, S(26), S(66), S(12), status_color());
+    SetRect(&r, S(50), S(60), S(SIDEBAR - 16), S(84));
     text(dc, g.line, r, g.status_font, p->ink, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-    SetRect(&r, S(52), S(56), S(SIDEBAR - 16), S(80));
+    SetRect(&r, S(50), S(84), S(SIDEBAR - 16), S(106));
     BOOL main_pc = g.cfg.role == ROLE_MAIN;
     int shown = shown_peer(), connected = 0;
     for (int i = 0; main_pc && i < MAX_PEERS; i++) connected += g.peer[i].addr[0] && up(i);
@@ -1706,7 +1784,7 @@ static void render(HDC dc, RECT c)
     text(dc, who, r, g.body, p->ink2, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     wchar_t rtt[32] = L"Response: \x2014";
     if (shown >= 0 && up(shown) && g.peer[shown].rtt >= 0) _snwprintf(rtt, 32, L"Response: %d ms", g.peer[shown].rtt);
-    SetRect(&r, S(28), S(92), S(SIDEBAR - 16), S(116));
+    SetRect(&r, S(50), S(106), S(SIDEBAR - 16), S(130));
     text(dc, rtt, r, g.body, p->ink2, DT_SINGLELINE | DT_VCENTER);
 
     SetRect(&r, S(28), fy - S(72), S(SIDEBAR - 16), fy - S(46));
@@ -1748,9 +1826,14 @@ static void render(HDC dc, RECT c)
     /* Footer last: the page scrolls under it. */
     SetRect(&r, 0, fy, c.right, c.bottom), fill(dc, &r, p->ground);
     SetRect(&r, 0, fy, c.right, fy + 1), fill(dc, &r, p->rule);
-    SetRect(&r, S(28), fy + S(18), c.right - S(260), c.bottom - S(18));
-    text(dc, L"Changes apply as you make them. Closing this window keeps Nexus running in the tray.", r,
-         g.body, p->ink2, DT_WORDBREAK);
+    SetRect(&r, S(28), fy, c.right - S(190), c.bottom);
+    text(dc, L"Changes apply as you make them. Closing this window keeps Nexus in the tray.", r, g.small, p->ink3,
+         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+    /* The page's scroll bar, over the right margin; a Windows one would stay white on the dark page. */
+    RECT thumb;
+    if (bar_thumb(&thumb)) round_rect(dc, &thumb, S(3), g.bar_hot || g.bar_grab >= 0 ? p->ink3 : p->edge,
+                                      g.bar_hot || g.bar_grab >= 0 ? p->ink3 : p->edge, S(1));
 }
 
 static void paint(HDC win, const RECT *dirty_part)
@@ -2399,6 +2482,8 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         g.fullscreen = add_button(L"", ID_FULLSCREEN, K_TOGGLE);
         g.hide_pointer = add_button(L"", ID_HIDE_POINTER, K_TOGGLE);
         g.logs = add_button(L"Open log folder", ID_LOGS, K_LINK);
+        g.pizza = add_button(L"Buy me a pizza", ID_PIZZA, K_LINK);
+        add_tooltip(g.pizza, L"Optional. It goes toward code signing and a Steam listing.");
         g.switch_key = add_button(L"Change", ID_SWITCH_KEY, K_OUTLINE);
         g.style[0] = add_button(L"", ID_STYLE_TAP, K_SEGMENT);
         g.style[1] = add_button(L"", ID_STYLE_HOLD, K_SEGMENT);
@@ -2415,27 +2500,43 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     case WM_MOUSEWHEEL:
         scroll_to(g.scroll - (short)HIWORD(wp) * S(48) / WHEEL_DELTA);
         return 0;
-    case WM_VSCROLL: {
-        RECT c;
+    case WM_LBUTTONDOWN: {
+        RECT t, c;
+        int x = (short)LOWORD(lp), y = (short)HIWORD(lp);
         GetClientRect(w, &c);
-        int page = c.bottom - S(FOOTER), to = g.scroll;
-        switch (LOWORD(wp)) {
-        case SB_LINEUP: to -= S(48); break;
-        case SB_LINEDOWN: to += S(48); break;
-        case SB_PAGEUP: to -= page; break;
-        case SB_PAGEDOWN: to += page; break;
-        case SB_TOP: to = 0; break;
-        case SB_BOTTOM: to = g.content_h; break;
-        case SB_THUMBTRACK: case SB_THUMBPOSITION: {
-            SCROLLINFO si = {sizeof si, SIF_TRACKPOS, 0, 0, 0, 0, 0};
-            GetScrollInfo(w, SB_VERT, &si);
-            to = si.nTrackPos;
-            break;
+        if (x < c.right - S(16) || y >= c.bottom - S(FOOTER) || !bar_thumb(&t)) return 0;
+        if (y >= t.top && y < t.bottom) {
+            g.bar_grab = y - t.top;
+            SetCapture(w);
+            redraw(NULL);
+        } else { /* beside the thumb: a page that way */
+            int page = c.bottom - S(FOOTER) - S(48);
+            scroll_to(g.scroll + (y < t.top ? -page : page));
         }
-        }
-        scroll_to(to);
         return 0;
     }
+    case WM_MOUSEMOVE: {
+        RECT c;
+        GetClientRect(w, &c);
+        BOOL hot = (short)LOWORD(lp) >= c.right - S(16) && (short)HIWORD(lp) < c.bottom - S(FOOTER);
+        if (g.bar_grab >= 0) bar_drag((short)HIWORD(lp));
+        if (hot != g.bar_hot) {
+            TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, w, 0};
+            TrackMouseEvent(&t);
+            g.bar_hot = hot;
+            redraw(NULL);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g.bar_hot) g.bar_hot = FALSE, redraw(NULL);
+        return 0;
+    case WM_LBUTTONUP:
+        if (g.bar_grab >= 0) ReleaseCapture();
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (g.bar_grab >= 0) g.bar_grab = -1, redraw(NULL);
+        return 0;
     case WM_INPUT_KEY: { /* the key the Keyboard page asked for; 0: Esc */
         int what = g.recording;
         g.recording = 0;
@@ -2454,7 +2555,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_GETMINMAXINFO:
         ((MINMAXINFO *)lp)->ptMinTrackSize.x = S(760);
-        ((MINMAXINFO *)lp)->ptMinTrackSize.y = S(640);
+        ((MINMAXINFO *)lp)->ptMinTrackSize.y = S(700);
         return 0;
     case WM_ERASEBKGND:
         return 1;
@@ -2502,6 +2603,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         } else if (id == ID_QUIT || id == ID_TRAY_QUIT) quit();
         else if (id == ID_TRAY_OPEN) show_window();
         else if (id == ID_SITE) ShellExecuteW(NULL, L"open", SITE_URL, NULL, NULL, SW_SHOWNORMAL);
+        else if (id == ID_PIZZA) ShellExecuteW(NULL, L"open", PIZZA_URL, NULL, NULL, SW_SHOWNORMAL);
         else if (id == ID_UPDATE) install_update();
         else if (id >= ID_FOUND0 && id <= ID_FOUND3 && g.found[id - ID_FOUND0].ip[0]) {
             wchar_t ip[16];
@@ -2887,6 +2989,43 @@ static DWORD WINAPI test_thread(void *unused)
     return 0;
 }
 
+/* The studio's shared card (%APPDATA%\ProtagonistLabs\apps\nexus.json), so Launchpad and the other apps see this one. */
+static void ecosystem_card(void)
+{
+    wchar_t path[MAX_PATH], tmp[MAX_PATH], exe[MAX_PATH];
+    char exe8[MAX_PATH * 3], escaped[MAX_PATH * 6], json[MAX_PATH * 7];
+    SYSTEMTIME t;
+    if (SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, path) != S_OK) return;
+    wcscat(path, L"\\ProtagonistLabs");
+    CreateDirectoryW(path, NULL);
+    wcscat(path, L"\\apps");
+    CreateDirectoryW(path, NULL);
+    wcscat(path, L"\\nexus.json");
+    _snwprintf(tmp, MAX_PATH, L"%ls.tmp", path);
+    tmp[MAX_PATH - 1] = 0;
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    WideCharToMultiByte(CP_UTF8, 0, exe, -1, exe8, sizeof exe8, NULL, NULL);
+    int at = 0;
+    for (const char *c = exe8; *c; c++) {
+        if (*c == '\\' || *c == '"') escaped[at++] = '\\';
+        escaped[at++] = *c;
+    }
+    escaped[at] = 0;
+    GetSystemTime(&t);
+    int n = _snprintf(json, sizeof json,
+                      "{\"schema\":1,\"updated\":\"%04d-%02d-%02dT%02d:%02d:%02dZ\",\"id\":\"nexus\",\"name\":\"Nexus\","
+                      "\"version\":\"" NEXUS_VERSION "\",\"exe\":\"%s\",\"edition\":\"free\",\"paid\":false,"
+                      "\"page\":\"https://protagonistlabs.app/nexus/\",\"commands\":{}}\n",
+                      t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, escaped);
+    HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD wrote;
+    BOOL ok = n > 0 && WriteFile(f, json, (DWORD)n, &wrote, NULL) && wrote == (DWORD)n;
+    CloseHandle(f);
+    if (ok) MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileW(tmp);
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
 {
     (void)prev;
@@ -2933,6 +3072,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     WideCharToMultiByte(CP_UTF8, 0, name, -1, g.my_name, sizeof g.my_name, NULL, NULL);
     lstrcpynW(g.my_name_w, name, 64);
     config_load();
+    if (!g.test) ecosystem_card();
     {
         wchar_t dir[MAX_PATH];
         lstrcpynW(dir, g.ini, MAX_PATH);
@@ -2971,8 +3111,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     RegisterClassExW(&wc);
 
     /* WS_EX_CONTROLPARENT + IsDialogMessage give Tab/Shift+Tab between the controls. */
-    CreateWindowExW(WS_EX_CONTROLPARENT, g.app_class, g.test ? L"Nexus (test)" : L"Nexus", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL,
-                    CW_USEDEFAULT, CW_USEDEFAULT, S(1000), S(800), NULL, NULL, inst, NULL);
+    RECT work;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int win_w = min(S(1000), work.right - work.left), win_h = min(S(800), work.bottom - work.top);
+    g.bar_grab = -1;
+    g.logo = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, S(32), S(32), 0);
+    CreateWindowExW(WS_EX_CONTROLPARENT, g.app_class, g.test ? L"Nexus (test)" : L"Nexus", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                    work.left + (work.right - work.left - win_w) / 2, work.top + (work.bottom - work.top - win_h) / 2,
+                    win_w, win_h, NULL, NULL, inst, NULL);
     /* A test instance leaves this PC's mouse and keys alone, unless a test VM asks for real hooks. */
     if (!g.test || wcsstr(cmd, L"/hooks")) input_main_start(g.wnd);
     files_init(g.wnd, net_send);
@@ -3003,6 +3149,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         }
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && field) {
             apply_field(msg.hwnd);
+            continue;
+        }
+        if (msg.message == WM_KEYDOWN && !field && g.recording == 0 && msg.wParam >= VK_PRIOR && msg.wParam <= VK_HOME) {
+            RECT c;
+            GetClientRect(g.wnd, &c);
+            int page = c.bottom - S(FOOTER) - S(48);
+            scroll_to(msg.wParam == VK_PRIOR ? g.scroll - page : msg.wParam == VK_NEXT ? g.scroll + page
+                      : msg.wParam == VK_HOME ? 0 : g.content_h);
             continue;
         }
         if (tile >= 0 && msg.message == WM_KEYDOWN && msg.wParam >= VK_LEFT && msg.wParam <= VK_DOWN) {

@@ -1,4 +1,4 @@
-<p align="center"><img src="res/nexus.ico" width="96" height="96" alt=""></p>
+<p align="center"><img src="res/nexus.png" width="96" height="96" alt=""></p>
 <h1 align="center">Nexus</h1>
 <p align="center">O tastatură, un mouse și sunetul, pentru mai multe PC-uri din rețea, de la Windows XP la Windows 11.</p>
 
@@ -7,7 +7,17 @@ clipboard-ul și fișierele copiate te urmează, iar sunetul PC-ului controlat s
 PC-ului principal. Până la patru PC-uri controlate se aranjează prin tragere pe o hartă în jurul
 PC-ului principal, iar cursorul trece din unul în altul ca între monitoarele aceluiași PC.
 
-> **Stare:** în lucru, versiunea 0.5: mouse, tastatură, clipboard (text și imagini), sunet, fișiere, update automat, descoperire în rețea și mai multe PC-uri pe o hartă, pe Windows (XP–11) și Linux (Wayland). Testată automat între Windows 11, XP, Kubuntu și Manjaro; planul și stadiul sunt în [SPEC.md](SPEC.md).
+> **Stare:** în lucru, versiunea 0.6: mouse, tastatură, clipboard (text și imagini), sunet, fișiere, update automat, descoperire în rețea și mai multe PC-uri pe o hartă, pe Windows (XP–11) și Linux (Wayland). Testată automat între Windows 11, XP, Kubuntu și Manjaro; planul și stadiul sunt în [SPEC.md](SPEC.md).
+
+## Ce e nou în 0.6
+
+- **Iconiță nouă**, în stilul celorlalte aplicații Protagonist Labs; aceleași două romburi legate.
+- **Fereastră mai îngrijită:** bară de derulare proprie, subțire (Page Up/Down, Home, End merg și ele), sidebar și
+  footer mai mici, numele aplicației sus, bara de titlu în culoarea ferestrei pe Windows 11, fereastra se deschide
+  în ecran și la 150%.
+- **Buy me a pizza** în sidebar: opțional, ajută la semnarea codului.
+- **Pagină pe site:** [protagonistlabs.app/nexus](https://protagonistlabs.app/nexus/). Nexus își scrie și cardul
+  în folderul comun al aplicațiilor (`%APPDATA%\ProtagonistLabs\apps\nexus.json`), ca Launchpad să-l vadă.
 
 ## Ce e nou în 0.5
 

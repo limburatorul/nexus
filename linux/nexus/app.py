@@ -668,6 +668,24 @@ def page_icon(page: int, color: str, size: int = 24) -> QIcon:
     return QIcon(pix)
 
 
+def pizza_icon() -> QIcon:
+    """The Windows app's pizza slice: an emoji may not be in the desktop's fonts."""
+    pix = QPixmap(32, 32)
+    pix.setDevicePixelRatio(2)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#f2b544"))
+    p.drawPolygon([QPointF(2, 3), QPointF(14, 3), QPointF(8, 15)])
+    p.setBrush(QColor("#d9482b"))
+    p.drawEllipse(QRectF(5, 5, 2.6, 2.6)), p.drawEllipse(QRectF(8.6, 7, 2.6, 2.6))
+    p.setPen(QPen(QColor("#b9772a"), 2.2, Qt.SolidLine, Qt.RoundCap))
+    p.drawLine(QPointF(2, 3), QPointF(14, 3))
+    p.end()
+    return QIcon(pix)
+
+
 class Light(QWidget):
     """A status light: the dot, and a soft halo around it while it is lit (connected)."""
 
@@ -793,6 +811,9 @@ class MapView(QWidget):
                     QTimer.singleShot(0, t.setFocus)
         win.focus_tile = None
 
+    def sizeHint(self) -> QSize:  # aligned in the page's layout, which then asks for this rather than the fixed size
+        return QSize(MAP_W * self.cell_w, MAP_H * self.cell_h)
+
     def cell_rect(self, x: int, y: int) -> QRect:
         return QRect((x + MAP_W // 2) * self.cell_w + 4, (y + MAP_H // 2) * self.cell_h + 4,
                      self.cell_w - 8, self.cell_h - 8)
@@ -857,6 +878,7 @@ class Window(QWidget):
         QLabel#small {{ color: {p['ink3']}; font-size: 13px; }}
         QLabel#eyebrow {{ color: {p['ink']}; font-size: 16px; font-weight: 600; }}
         QLabel#line {{ font-weight: 600; font-size: 15px; }}
+        QLabel#brand {{ font-weight: 700; font-size: 19px; }}
         QLabel#keycap {{ background: {p['well']}; border: 1px solid {p['edge']}; border-radius: 8px;
                          font-family: 'B612 Mono'; font-size: 13px; padding: 10px 18px; }}
         #module {{ background: {p['panel']}; border: 1px solid {p['rule']}; border-radius: 12px; }}
@@ -865,7 +887,7 @@ class Window(QWidget):
         QPushButton:hover {{ background: {p['well']}; border-color: {p['ink2']}; }}
         QPushButton:checked {{ background: {p['ink']}; color: {p['ground']}; border-color: {p['ink']}; }}
         QPushButton:focus {{ outline: none; border: 2px solid {p['signal']}; }}
-        QPushButton#nav {{ border: none; text-align: left; padding: 14px 16px; font-weight: 400; font-size: 15px;
+        QPushButton#nav {{ border: none; text-align: left; padding: 9px 14px; font-weight: 400; font-size: 14px;
                            color: {p['ink2']}; border-left: 3px solid transparent; border-radius: 8px; }}
         QPushButton#nav:hover {{ background: {p['panel']}; color: {p['ink']}; }}
         QPushButton#nav:checked {{ background: {p['well']}; color: {p['ink']}; font-weight: 600;
@@ -876,6 +898,11 @@ class Window(QWidget):
         QLineEdit {{ background: {p['well']}; border: 1px solid {p['edge']}; border-radius: 8px; padding: 10px 12px; }}
         QLineEdit:focus {{ border-color: {p['signal']}; }}
         QScrollArea {{ border: none; }}
+        QScrollBar:vertical {{ background: transparent; width: 16px; margin: 8px 0; }}
+        QScrollBar::handle:vertical {{ background: {p['edge']}; border-radius: 3px; margin: 0 5px; min-height: 36px; }}
+        QScrollBar::handle:vertical:hover {{ background: {p['ink3']}; }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
         """
 
     def _label(self, text="", name="body", wrap=True) -> QLabel:
@@ -895,12 +922,20 @@ class Window(QWidget):
         outer.addLayout(top, 1)
 
         side = QFrame(objectName="sidebar")
-        side.setFixedWidth(280)
+        side.setFixedWidth(232)
         sl = QVBoxLayout(side)
         sl.setContentsMargins(0, 0, 0, 0)
         status = QFrame(objectName="status")
         stl = QVBoxLayout(status)
-        stl.setContentsMargins(28, 28, 16, 18)
+        stl.setContentsMargins(20, 16, 16, 16)
+        brand = QHBoxLayout()
+        logo = QLabel()
+        logo.setPixmap(QIcon(os.path.join(RES, "nexus.png")).pixmap(32, 32))
+        brand.addWidget(logo)
+        brand.addSpacing(10)
+        brand.addWidget(self._label("Nexus", "brand", wrap=False), 1)
+        stl.addLayout(brand)
+        stl.addSpacing(8)
         row = QHBoxLayout()
         self.dot = Light(12)
         self.line = self._label(name="line", wrap=False)
@@ -916,8 +951,8 @@ class Window(QWidget):
         stl.addWidget(self.response)
         sl.addWidget(status)
         nav = QVBoxLayout()
-        nav.setContentsMargins(16, 16, 16, 16)
-        nav.setSpacing(4)
+        nav.setContentsMargins(16, 12, 16, 12)
+        nav.setSpacing(2)
         self.navs = []
         for i, (name, _d, _e) in enumerate(PAGES):
             b = QPushButton(name, objectName="nav", checkable=True)
@@ -929,6 +964,13 @@ class Window(QWidget):
         sl.addStretch(1)
         foot = QVBoxLayout()
         foot.setContentsMargins(28, 0, 16, 16)
+        pizza = QPushButton("Buy me a pizza", objectName="link")
+        pizza.setIcon(pizza_icon())
+        pizza.setIconSize(QSize(16, 16))
+        pizza.setToolTip("Optional. It goes toward code signing and a Steam listing.")
+        pizza.setAccessibleName("Buy me a pizza")
+        pizza.clicked.connect(lambda: __import__("webbrowser").open("https://buymeacoffee.com/protagonistlabs"))
+        foot.addWidget(pizza)
         foot.addWidget(self._label("Nexus " + VERSION, "small"))
         site = QPushButton("Nexus on GitHub", objectName="link")
         site.clicked.connect(lambda: __import__("webbrowser").open(SITE))
@@ -938,17 +980,18 @@ class Window(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.content = QWidget(objectName="content")
         scroll.setWidget(self.content)
         top.addWidget(scroll, 1)
 
         footer = QFrame(objectName="footer")
         fl = QHBoxLayout(footer)
-        fl.setContentsMargins(28, 18, 32, 18)
-        fl.addWidget(self._label("Changes apply as you make them. Closing this window keeps Nexus running in "
-                                 "the tray."), 1)
+        fl.setContentsMargins(28, 18, 28, 18)
+        fl.addWidget(self._label("Changes apply as you make them. Closing this window keeps Nexus in the tray.",
+                                 "small"), 1)
         quit_btn = QPushButton("Quit Nexus")
-        quit_btn.setMinimumSize(190, 48)
+        quit_btn.setMinimumSize(140, 40)
         quit_btn.clicked.connect(QApplication.quit)
         fl.addWidget(quit_btn)
         outer.addWidget(footer)
@@ -1012,7 +1055,7 @@ class Window(QWidget):
             QWidget().setLayout(old)  # hands the old layout and its widgets to a throwaway parent
         c, main = self.c, self.c.cfg.role == "main"
         lay = QVBoxLayout(self.content)
-        lay.setContentsMargins(40, 40, 40, 28)
+        lay.setContentsMargins(36, 36, 36, 28)
         lay.setSpacing(0)
         name, desc, eyebrow = PAGES[self.page]
         lay.addWidget(self._label(name, "title", wrap=False))
