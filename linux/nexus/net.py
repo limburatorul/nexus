@@ -161,6 +161,9 @@ class Session:
 
     def _session(self, sock, cfg) -> int:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Input shares this connection with file copies: uncapped, megabytes of a copy queue ahead of it.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
         sock.settimeout(6)  # both ends ping every second; silence this long means the link is gone
         with self._lock:
             self._sock = sock

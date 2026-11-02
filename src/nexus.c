@@ -115,6 +115,7 @@ typedef struct {
     CRITICAL_SECTION send_cs; /* one sender at a time, without holding up the other PCs */
     Link link;
     BOOL link_up;      /* link and link_up under send_cs */
+    volatile LONG urgent; /* senders waiting for send_cs other than a file copy, which lets them go first */
     HANDLE wake;
     wchar_t name[64];  /* from the handshake, under g.cs */
     char version[16];  /* "" from a Nexus too old to say */
@@ -405,10 +406,20 @@ static BOOL net_send(int pc, const unsigned char *msg, int len)
 {
     if (pc < 0 || pc >= MAX_PEERS) return FALSE;
     Peer *p = &g.peer[pc];
+    InterlockedIncrement(&p->urgent);
     EnterCriticalSection(&p->send_cs);
+    InterlockedDecrement(&p->urgent);
     BOOL ok = p->link_up && link_send(&p->link, msg, len);
     LeaveCriticalSection(&p->send_cs);
     return ok;
+}
+
+/* A file copy's chunk: after any input waiting for the link. A critical section is not fair, and the
+ * copy, back for its next chunk at once, would otherwise keep the pointer waiting for seconds. */
+static BOOL net_send_bulk(int pc, const unsigned char *msg, int len)
+{
+    while (pc >= 0 && pc < MAX_PEERS && g.peer[pc].urgent) Sleep(0);
+    return net_send(pc, msg, len);
 }
 
 /* Drops a PC's connection (-1: all of them) and makes its thread re-read the config. */
@@ -475,8 +486,13 @@ static int session(int pc, SOCKET s, int role, const unsigned char key[32])
     Peer *p = &g.peer[pc];
     BOOL on = TRUE;
     DWORD timeout = 6000; /* both ends ping every second; silence this long means the link is gone */
+    /* Input shares this connection with file copies: without a cap Windows buffers megabytes of a copy
+     * at each end, and every move and key waits behind them. 64 KB still fills a home network. */
+    int buffer = 65536;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *)&on, sizeof on);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof timeout);
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&buffer, sizeof buffer);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&buffer, sizeof buffer);
     EnterCriticalSection(&g.cs);
     p->conn = s;
     LeaveCriticalSection(&g.cs);
@@ -3136,7 +3152,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
                     win_w, win_h, NULL, NULL, inst, NULL);
     /* A test instance leaves this PC's mouse and keys alone, unless a test VM asks for real hooks. */
     if (!g.test || wcsstr(cmd, L"/hooks")) input_main_start(g.wnd);
-    files_init(g.wnd, net_send);
+    files_init(g.wnd, net_send_bulk);
     if (g.test) CloseHandle(CreateThread(NULL, 0, test_thread, NULL, 0, NULL));
     else update_start(g.wnd, is_main_pc);
     sync_input();
