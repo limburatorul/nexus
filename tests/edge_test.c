@@ -15,6 +15,12 @@ int main(void)
     Screens s = {{{0, 0, 3840, 2160}, {3840, 0, 5760, 1080}}, 2, 0};
     int lo, hi;
 
+    /* Crossing left off the 4K, parked in its middle: a move Windows queued at the edge is stale, one
+     * from the middle is not (and the reverse on the way back). */
+    assert(stale(pt(0, 1100), pt(1920, 1080), pt(2, 1080)));
+    assert(!stale(pt(1950, 1070), pt(1920, 1080), pt(2, 1080)));
+    assert(stale(pt(1950, 1070), pt(2, 1080), pt(1920, 1080)));
+
     /* Staggered: the 4K's right edge below the 1080p screen is a wall too, not only the desktop's. */
     assert(wall_at(&s, pt(5759, 500), EDGE_RIGHT));
     assert(wall_at(&s, pt(3839, 1500), EDGE_RIGHT));   /* nothing to the right of it there */

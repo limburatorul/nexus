@@ -27,6 +27,7 @@
 #define LANDING_CLEAR_PX (CORNER_PX + 2) /* an arrival lands at least this far from the ends */
 #define GRACE_PX 4                       /* after arriving: this much travel back in, or */
 #define GRACE_MS 300                     /* this long, before the edge counts pushes again */
+#define SETTLE_MS 200                    /* moves Windows had queued before the pointer was set: this old at most */
 #define DECAY_PX_PER_S (DEFAULT_RESISTANCE * 1000 / 400) /* the push fades in 0.4 s when the hand stops */
 
 static const int STEP_X[] = {-1, 1, 0, 0}, STEP_Y[] = {0, 0, -1, 1}; /* a pixel through each edge */
@@ -284,12 +285,12 @@ BOOL input_desktop_unlocked(void)
 static struct {
     HWND ui, hider;
     DWORD thread;
-    BOOL connected, remote, tap_clean, raw_ok, abs_pointer, holding, switch_eaten;
+    BOOL connected, remote, tap_clean, raw_ok, abs_pointer, holding, switch_eaten, settling;
     int edges, buttons, recording; /* edges: bit per edge of this screen that leads to a connected PC */
     InputConfig cfg;
     BYTE down[256], passdown[256];
     POINT park, back;
-    DWORD last_tap;
+    DWORD last_tap, moved_at; /* moved_at: when the pointer was parked or set back */
     Press press[4];
     Screens screens;
     DWORD mouse_events, key_events, raw_events, last_vk, last_flags; /* for the test mode's "hooks" */
@@ -314,6 +315,7 @@ static void enter(POINT from, BOOL keep, int edge, int pc)
     m.park.y = (mi.rcMonitor.top + mi.rcMonitor.bottom) / 2;
     SetWindowPos(m.hider, HWND_TOPMOST, m.park.x - 32, m.park.y - 32, 64, 64, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetCursorPos(m.park.x, m.park.y);
+    m.settling = TRUE, m.moved_at = GetTickCount();
     PostMessageW(m.ui, WM_INPUT_STATE, TRUE, 0);
 }
 
@@ -322,6 +324,7 @@ static void leave_local(POINT to)
     m.remote = m.holding = FALSE;
     ShowWindow(m.hider, SW_HIDE);
     SetCursorPos(to.x, to.y);
+    m.back = to, m.settling = TRUE, m.moved_at = GetTickCount();
     for (int e = 0; e < 4; e++) press_arrive(&m.press[e], GetTickCount());
     PostMessageW(m.ui, WM_INPUT_STATE, FALSE, 0);
 }
@@ -407,6 +410,16 @@ static void touch(POINT p)
     }
 }
 
+/* Moves Windows worked out before the pointer was put elsewhere (parked on crossing, set at the way
+ * back in) still arrive for a moment, relative to where it was. Taken as they are, input jumps by the
+ * distance between the two: onto the far edge over there, or the middle of this screen on the way back.
+ * ponytail: told apart by the nearer point; one real move longer than half that distance is lost too */
+static BOOL stale(POINT pt, POINT now, POINT before)
+{
+    LONGLONG bx = pt.x - before.x, by = pt.y - before.y, nx = pt.x - now.x, ny = pt.y - now.y;
+    return bx * bx + by * by < nx * nx + ny * ny;
+}
+
 static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
 {
     MSLLHOOKSTRUCT *e = (MSLLHOOKSTRUCT *)lp;
@@ -423,6 +436,11 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM wp, LPARAM lp)
     case WM_MBUTTONUP: btn = 3; break;
     case WM_XBUTTONDOWN: down = 1; /* fall through */
     case WM_XBUTTONUP: btn = HIWORD(e->mouseData) == XBUTTON1 ? 4 : 5; break;
+    }
+    if (wp == WM_MOUSEMOVE && m.settling) { /* such moves are a few ms old; later ones are the hand's */
+        if (GetTickCount() - m.moved_at < SETTLE_MS && (m.remote ? stale(e->pt, m.park, m.back) : stale(e->pt, m.back, m.park)))
+            return 1;
+        m.settling = FALSE;
     }
     if (!m.remote) {
         /* Never cross mid-drag: the button would stay down here and arrive up-only there. */
