@@ -2408,7 +2408,7 @@ static void beat(void)
         int pc = g.target;
         Peer *p = &g.peer[pc];
         ping(pc);
-        if (now - p->heard > LINK_DEAD_MS) {
+        if ((LONG)(now - p->heard) > LINK_DEAD_MS) { /* signed: the network thread may have heard it after now */
             wchar_t t[200];
             log_line("link %d: silent for %lu ms while it had input; input comes home", pc, (unsigned long)(now - p->heard));
             g.target = -1;
@@ -2426,7 +2426,7 @@ static void beat(void)
     BOOL connected = g.cfg.role == ROLE_CONTROLLED && g.peer[0].status == NS_CONNECTED;
     if (connected && input_controlled_active()) {
         ping(0);
-        BOOL stop = now - g.peer[0].heard > LINK_DEAD_MS;
+        BOOL stop = (LONG)(now - g.peer[0].heard) > LINK_DEAD_MS;
         locked = input_desktop_unlocked() ? 0 : locked + 1;
         if (locked >= 2) { /* twice in a row, 250 ms apart: not a flicker */
             log_line("this PC's desktop is locked: input goes back to the main PC");
