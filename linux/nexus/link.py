@@ -28,7 +28,10 @@ MAGIC = b"NXUS"
 
 (HELLO, PING, PONG, ENTER, LEAVE, MOVE, BUTTON, WHEEL, KEY, CLIPBOARD, AUDIO, AUDIO_STATE,
  FILE_BEGIN, FILE, FILE_DATA, FILE_END, UPDATE_BEGIN, UPDATE_DATA, UPDATE_END, TEST,
- KEX, LOCKED, CLIP_BEGIN, CLIP_DATA, CLIP_END) = range(1, 26)  # from KEX on: 0.5 peers only
+ KEX, LOCKED, CLIP_BEGIN, CLIP_DATA, CLIP_END, CHANNEL) = range(1, 27)  # from KEX on: 0.5 peers only
+# 0.7: CHANNEL [kind] is the main PC's first message on each connection; files and the clipboard each
+# have their own, so input never waits behind them.
+CHAN_INPUT, CHAN_FILES, CHAN_CLIP = 0, 1, 2
 CLIP_TEXT, CLIP_DIB = 1, 2  # UTF-8; a Windows CF_DIB (BITMAPINFOHEADER, colours, pixels)
 CLIP_MAX = {CLIP_TEXT: 256 * 1024, CLIP_DIB: 8 * 1024 * 1024}
 DEAD_SECONDS = 2.0  # nothing heard this long while input is across: the link is gone
@@ -41,6 +44,15 @@ def v5(version: str) -> bool:
     except ValueError:
         return False
     return major > 0 or minor >= 5
+
+
+def v7(version: str) -> bool:
+    """Whether a Nexus version has 0.7's own connections for files and the clipboard."""
+    try:
+        major, minor = (int(v) for v in version.split(".")[:2])
+    except ValueError:
+        return False
+    return major > 0 or minor >= 7
 
 
 def clip_out(fmt: int, data: bytes):

@@ -7,12 +7,14 @@ import logging.handlers
 import os
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 
-from PySide6.QtCore import QBuffer, QIODevice, QObject, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (QBuffer, QIODevice, QObject, QRect, QRectF, QSize, Qt, QTimer, QUrl, QVariantAnimation, Signal,
+                            Slot)
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon, QImage,
                            QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
@@ -154,6 +156,7 @@ class Controller(QObject):
         self.remote, self.target, self.last, self.audio_state, self.files_note = False, -1, -1, 0, ""
         self.paused = False  # crossing paused from the tray or the Crossing page (this session only)
         self.clip_in = link.ClipIn()
+        self._clip_lock, self._clip_gen = threading.Lock(), [0] * MAX_PEERS
         self._locked = 0  # lock checks in a row that found this controlled PC locked
         self.state = [net.SETUP] * MAX_PEERS  # each session's status, as this thread last heard it
         self.sessions, self.files = [], []
@@ -161,7 +164,7 @@ class Controller(QObject):
             f = Files(None, self._note.emit, self._files_done.emit)
             s = net.Session(self.cfg, self.name, VERSION, self.port, lambda st, i=i: self._status.emit(i, st),
                             lambda m, i=i: self._message.emit(i, m), files=f, index=i)
-            f.send = s.send
+            f.send = lambda msg, s=s: s.send_chan(link.CHAN_FILES, msg)
             self.sessions.append(s)
             self.files.append(f)
         self.sound_capture = sound.Capture(self._send, self._audio.emit)
@@ -282,15 +285,21 @@ class Controller(QObject):
     @Slot(int, bytes)
     def on_message(self, pc: int, msg: bytes) -> None:
         kind = msg[0]
-        if kind == link.CLIPBOARD and len(msg) > 1:
-            self.clipboard.set_text(msg[1:].decode("utf-8", "replace"))
-        elif link.CLIP_BEGIN <= kind <= link.CLIP_END:
-            done = self.clip_in.feed(msg)
-            if done:
+        if (kind == link.CLIPBOARD and len(msg) > 1) or link.CLIP_BEGIN <= kind <= link.CLIP_END:
+            if kind == link.CLIPBOARD:
+                self.clipboard.set_text(msg[1:].decode("utf-8", "replace"))
+            else:
+                done = self.clip_in.feed(msg)
+                if not done:
+                    return
                 text = done.get(link.CLIP_TEXT)
                 png = dib_to_png(done[link.CLIP_DIB]) if link.CLIP_DIB in done else None
                 self.clipboard.set_clip(text.decode("utf-8", "replace") if text else None, png)
                 LOG.info("clipboard: received %d bytes of text and a %d-byte picture", len(text or b""), len(png or b""))
+            # Copied on a PC that input has already left for another (its own connection, or its own
+            # thread, can be a moment behind the crossing): it goes on there too.
+            if self.cfg.role == "main" and self.target >= 0 and self.target != pc:
+                self.send_clipboard(self.target, relay=True)
         elif kind == link.LOCKED and len(msg) == 1 and self.cfg.role == "main" and pc == self.target:
             if self.capture:
                 self.capture.home(None, None)
@@ -358,6 +367,7 @@ class Controller(QObject):
         elif self.cfg.role == "controlled" and self.injector.active and self.state[0] == net.CONNECTED:
             s, stop = self.sessions[0], False
             if now - s.heard > link.DEAD_SECONDS:
+                LOG.info("link 0: silent for %.1f s while this PC had input; input stops here", now - s.heard)
                 stop = True
             self._locked = self._locked + 1 if wayland_locked() else 0
             if self._locked >= 2:  # twice in a row, not a flicker
@@ -452,22 +462,31 @@ class Controller(QObject):
             return
         text, png = value
         data = text.encode("utf-8") if text else b""
+        msgs = []
         if not link.v5(s.peer_version):  # an older peer: text up to 64 KB, as before
             if data and len(data) < link.MAX:
-                s.send(bytes([link.CLIPBOARD]) + data)
-            return
-        # Text and picture together; over a limit that part stays behind, never cut short.
-        dib = png_to_dib(png) if png else b""
-        sent = False
-        for fmt, part in ((link.CLIP_TEXT, data), (link.CLIP_DIB, dib)):
-            if part and len(part) <= link.CLIP_MAX[fmt]:
-                for msg in link.clip_out(fmt, part):
-                    s.send(msg)
-                sent = True
-            elif part:
-                LOG.info("clipboard: %d bytes of format %d stay here (over the limit)", len(part), fmt)
-        if sent:
-            s.send(bytes([link.CLIP_END]))
+                msgs.append(bytes([link.CLIPBOARD]) + data)
+        else:  # text and picture together; over a limit that part stays behind, never cut short
+            dib = png_to_dib(png) if png else b""
+            for fmt, part in ((link.CLIP_TEXT, data), (link.CLIP_DIB, dib)):
+                if part and len(part) <= link.CLIP_MAX[fmt]:
+                    msgs += link.clip_out(fmt, part)
+                elif part:
+                    LOG.info("clipboard: %d bytes of format %d stay here (over the limit)", len(part), fmt)
+            if msgs:
+                msgs.append(bytes([link.CLIP_END]))
+        if msgs:
+            self._clip_gen[pc] += 1
+            threading.Thread(target=self._send_clip, args=(pc, self._clip_gen[pc], msgs), daemon=True).start()
+
+    def _send_clip(self, pc: int, gen: int, msgs) -> None:
+        """On its own thread, so input never waits for a big picture to travel: one copy at a time, and a
+        newer copy for the same PC goes instead of an older one still waiting."""
+        with self._clip_lock:
+            if gen == self._clip_gen[pc]:
+                for msg in msgs:
+                    if not self.sessions[pc].send_chan(link.CHAN_CLIP, msg):
+                        break
 
     def cross(self, pc: int = -1) -> bool:
         """Main PC: input goes to pc, else the PC used last (the shortcut and tests end here)."""
@@ -895,6 +914,10 @@ class Window(QWidget):
         QPushButton#link {{ border: none; text-align: left; padding: 4px 0; font-weight: 400; color: {p['ink3']};
                             font-size: 13px; }}
         QPushButton#link:hover {{ color: {p['ink']}; background: transparent; }}
+        QPushButton#pizza {{ background: #D63A3A; border: none; padding: 6px 12px; color: #FFFFFF; font-size: 14px; }}
+        QPushButton#pizza:hover {{ background: #E54848; }}
+        QPushButton#pizza:pressed {{ background: #BF3030; }}
+        QPushButton#pizza:focus {{ border: 2px solid {p['signal']}; }}
         QLineEdit {{ background: {p['well']}; border: 1px solid {p['edge']}; border-radius: 8px; padding: 10px 12px; }}
         QLineEdit:focus {{ border-color: {p['signal']}; }}
         QScrollArea {{ border: none; }}
@@ -964,13 +987,23 @@ class Window(QWidget):
         sl.addStretch(1)
         foot = QVBoxLayout()
         foot.setContentsMargins(28, 0, 16, 16)
-        pizza = QPushButton("Buy me a pizza", objectName="link")
+        pizza = QPushButton("Buy me a pizza", objectName="pizza")
         pizza.setIcon(pizza_icon())
         pizza.setIconSize(QSize(16, 16))
         pizza.setToolTip("Optional. It goes toward code signing and a Steam listing.")
         pizza.setAccessibleName("Buy me a pizza")
         pizza.clicked.connect(lambda: __import__("webbrowser").open("https://buymeacoffee.com/protagonistlabs"))
         foot.addWidget(pizza)
+        foot.addSpacing(6)
+        self.pizza = pizza
+        # The nudge: 3 s after the window shows, then every 10 s while it is on screen, the red brightens
+        # twice in 700 ms. A widget cannot be scaled, so only the colour pulses (the Windows app also grows).
+        self.nudge = QVariantAnimation(self, duration=700)
+        for at, color in ((0, "#D63A3A"), (0.14, "#F25555"), (0.42, "#D63A3A"), (0.56, "#F25555"), (1, "#D63A3A")):
+            self.nudge.setKeyValueAt(at, QColor(color))
+        self.nudge.valueChanged.connect(lambda c: pizza.setStyleSheet(f"background: {c.name()};"))
+        self.nudge.finished.connect(lambda: pizza.setStyleSheet(""))  # back to the hover/pressed rules
+        self.nudge_timer = QTimer(self, interval=3000, timeout=self._pulse_pizza)
         foot.addWidget(self._label("Nexus " + VERSION, "small"))
         site = QPushButton("Nexus on GitHub", objectName="link")
         site.clicked.connect(lambda: __import__("webbrowser").open(SITE))
@@ -1304,9 +1337,33 @@ class Window(QWidget):
         self.releaseKeyboard()
         self.refresh()
 
+    def _pulse_pizza(self) -> None:
+        self.nudge_timer.setInterval(10000)
+        if not self.pizza.underMouse():
+            self.nudge.start()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if animations_on() and not self.nudge_timer.isActive():
+            self.nudge_timer.start()
+
+    def hideEvent(self, event) -> None:  # also sent when the window is minimized
+        super().hideEvent(event)
+        self.nudge_timer.stop()
+
     def closeEvent(self, event) -> None:  # closing keeps Nexus in the tray
         event.ignore()
         self.hide()
+
+
+def animations_on() -> bool:
+    """GNOME's "Animations" switch; desktops without gsettings count as on."""
+    try:
+        out = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "enable-animations"],
+                             capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return out.strip() != "false"
 
 
 def local_addresses() -> str:

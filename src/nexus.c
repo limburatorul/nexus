@@ -43,6 +43,9 @@
 #define MAP_H 3
 #define TIMER_PING 1
 #define TIMER_BEAT 2 /* 250 ms: the heartbeat while input is across, the lock check */
+#define TIMER_NUDGE 3 /* the pizza button's nudge: 3 s after the first show, then every 10 s */
+#define TIMER_NUDGE_FRAME 4 /* its frames, for the 700 ms it lasts */
+#define NUDGE_MS 700
 #define WM_SCROLL_TO (WM_APP + 9) /* a control got the focus: scroll it into view */
 
 enum { ID_TRAY_OPEN = 1, ID_TRAY_QUIT, ID_TRAY_SEND, ID_TRAY_PAUSE, ID_TRAY_LOGS, ID_TRAY_ABOUT, ID_TRAY_WAKE0,
@@ -107,6 +110,14 @@ static const wchar_t *STATUS_NOTE[] = {
 static const wchar_t *EDGE_NAMES[] = {L"left", L"right", L"top", L"bottom"};
 static const int DIR_X[] = {-1, 1, 0, 0}, DIR_Y[] = {0, 0, -1, 1}; /* a step through each edge */
 
+/* A 0.7 PC's own connection for files or the clipboard: up only while its input link is. */
+typedef struct {
+    SOCKET s;           /* under g.cs */
+    CRITICAL_SECTION cs; /* one sender at a time */
+    Link link;
+    BOOL up;            /* link and up under cs */
+} Chan;
+
 /* A controlled PC: where it is (config), its link (network threads) and what the UI shows of it. */
 typedef struct {
     wchar_t addr[128]; /* empty: a free slot */
@@ -116,6 +127,7 @@ typedef struct {
     Link link;
     BOOL link_up;      /* link and link_up under send_cs */
     volatile LONG urgent; /* senders waiting for send_cs other than a file copy, which lets them go first */
+    Chan ch[CHAN_CLIP + 1]; /* [CHAN_FILES], [CHAN_CLIP] */
     HANDLE wake;
     wchar_t name[64];  /* from the handshake, under g.cs */
     char version[16];  /* "" from a Nexus too old to say */
@@ -151,6 +163,8 @@ static struct {
     HFONT title, body, nav_font, nav_sel, status_font, eyebrow, button, small, mono, brand;
     HICON logo;
     BOOL bar_hot;  /* the pointer is over the page's scroll bar */
+    BOOL nudged;   /* the pizza button has been nudged once: later nudges wait 10 s */
+    DWORD nudge_at; /* when the running nudge started, 0 for none */
     int bar_grab;  /* dragging its thumb: where in the thumb it was grabbed, -1 for no drag */
     RECT desc_rc, module_rc;
     Label labels[64];
@@ -172,6 +186,7 @@ static struct {
 
     /* network */
     CRITICAL_SECTION cs;
+    CRITICAL_SECTION session_cs; /* controlled PC: one input link at a time, a newer one waits for the old to end */
     SOCKET listener;
     int gen;
     char my_name[64];
@@ -422,6 +437,103 @@ static BOOL net_send_bulk(int pc, const unsigned char *msg, int len)
     return net_send(pc, msg, len);
 }
 
+static BOOL link_v7(const char *version) { return version_cmp(version, "0.7.0") >= 0; }
+
+/* Files or the clipboard: on that kind's own connection (0.7), else on the input link as before. */
+static BOOL chan_send(int pc, int kind, const unsigned char *msg, int len)
+{
+    if (pc < 0 || pc >= MAX_PEERS) return FALSE;
+    Chan *c = &g.peer[pc].ch[kind];
+    EnterCriticalSection(&c->cs);
+    BOOL own = c->up, ok = own && link_send(&c->link, msg, len);
+    LeaveCriticalSection(&c->cs);
+    if (own) return ok;
+    return kind == CHAN_FILES ? net_send_bulk(pc, msg, len) : net_send(pc, msg, len);
+}
+
+static BOOL files_out(int pc, const unsigned char *msg, int len) { return chan_send(pc, CHAN_FILES, msg, len); }
+static BOOL clip_send(int pc, const unsigned char *msg, int len) { return chan_send(pc, CHAN_CLIP, msg, len); }
+
+/* Runs a files or clipboard connection after its handshake, until it or the input link ends. Files are
+ * written to disk on this thread, and the clipboard goes to the UI thread as the input link's does. */
+static void chan_run(int pc, int kind, SOCKET s, const Link *l)
+{
+    Chan *c = &g.peer[pc].ch[kind];
+    DWORD quiet = 0; /* silent between copies; it closes with the input link instead */
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&quiet, sizeof quiet);
+    EnterCriticalSection(&g.cs);
+    if (c->s != INVALID_SOCKET) shutdown(c->s, SD_BOTH); /* a newer one replaces it */
+    c->s = s;
+    LeaveCriticalSection(&g.cs);
+    EnterCriticalSection(&c->cs);
+    c->link = *l;
+    c->up = TRUE;
+    LeaveCriticalSection(&c->cs);
+    Link in = *l;
+    unsigned char *buf = malloc(1 + LINK_MAX);
+    int n;
+    while (buf && (n = link_recv(&in, buf + 1, LINK_MAX)) > 0) {
+        unsigned char *m = buf + 1;
+        if (kind == CHAN_FILES && m[0] >= MSG_FILE_BEGIN && m[0] <= MSG_FILE_END) {
+            files_receive(m, n);
+        } else if (kind == CHAN_CLIP && (m[0] == MSG_CLIPBOARD || (m[0] >= MSG_CLIP_BEGIN && m[0] <= MSG_CLIP_END))) {
+            unsigned char *copy = malloc(1 + n);
+            if (!copy) continue;
+            copy[0] = (unsigned char)pc;
+            memcpy(copy + 1, m, n);
+            if (!PostMessageW(g.wnd, WM_NET_MSG, n, (LPARAM)copy)) free(copy);
+        }
+    }
+    free(buf);
+    EnterCriticalSection(&g.cs);
+    BOOL mine = c->s == s;
+    if (mine) c->s = INVALID_SOCKET;
+    LeaveCriticalSection(&g.cs);
+    if (mine) {
+        EnterCriticalSection(&c->cs);
+        c->up = FALSE;
+        LeaveCriticalSection(&c->cs);
+    }
+    if (kind == CHAN_FILES) files_abort();
+    closesocket(s);
+}
+
+/* With the input link gone, its files and clipboard connections go too. */
+static void chan_close(int pc)
+{
+    EnterCriticalSection(&g.cs);
+    for (int k = CHAN_FILES; k <= CHAN_CLIP; k++)
+        if (g.peer[pc].ch[k].s != INVALID_SOCKET) shutdown(g.peer[pc].ch[k].s, SD_BOTH);
+    LeaveCriticalSection(&g.cs);
+}
+
+static SOCKET dial(const char *host);
+
+typedef struct { int pc, kind; char host[16]; unsigned char key[32]; } ChanStart;
+
+/* Main PC: opens one of a 0.7 PC's own connections, beside its input link. */
+static DWORD WINAPI chan_thread(void *arg)
+{
+    ChanStart *a = arg;
+    SOCKET s = dial(a->host);
+    Link l;
+    char peer[64], peer_version[16];
+    unsigned char m[2] = {MSG_CHANNEL, (unsigned char)a->kind};
+    DWORD timeout = 6000;
+    if (s != INVALID_SOCKET) setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof timeout);
+    if (s != INVALID_SOCKET && link_handshake(&l, s, TRUE, a->key, g.my_name, NEXUS_VERSION, peer, peer_version) == LINK_OK &&
+        link_send(&l, m, 2)) {
+        chan_run(a->pc, a->kind, s, &l);
+    } else {
+        log_line("link %d: no own connection for %s, so it shares the input link", a->pc,
+                 a->kind == CHAN_FILES ? "files" : "the clipboard");
+        if (s != INVALID_SOCKET) closesocket(s);
+    }
+    SecureZeroMemory(a->key, 32);
+    free(a);
+    return 0;
+}
+
 /* Drops a PC's connection (-1: all of them) and makes its thread re-read the config. */
 static void net_restart(int pc)
 {
@@ -480,83 +592,16 @@ static SOCKET listen_socket(void)
     return s;
 }
 
-/* Runs one connection: handshake, then every message goes to the UI thread, pings answered here. */
-static int session(int pc, SOCKET s, int role, const unsigned char key[32])
+static void link_options(SOCKET s)
 {
-    Peer *p = &g.peer[pc];
     BOOL on = TRUE;
     DWORD timeout = 6000; /* both ends ping every second; silence this long means the link is gone */
-    /* Input shares this connection with file copies: without a cap Windows buffers megabytes of a copy
-     * at each end, and every move and key waits behind them. 64 KB still fills a home network. */
-    int buffer = 65536;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char *)&on, sizeof on);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof timeout);
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&buffer, sizeof buffer);
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&buffer, sizeof buffer);
-    EnterCriticalSection(&g.cs);
-    p->conn = s;
-    LeaveCriticalSection(&g.cs);
+}
 
-    Link l;
-    char peer[64], peer_version[16];
-    int r = link_handshake(&l, s, role == ROLE_MAIN, key, g.my_name, NEXUS_VERSION, peer, peer_version);
-    if (r == LINK_OK) {
-        EnterCriticalSection(&g.cs);
-        MultiByteToWideChar(CP_UTF8, 0, peer, -1, p->name, 64);
-        lstrcpynA(p->version, peer_version, 16);
-        p->secret = l.forward_secret;
-        p->heard = GetTickCount();
-        LeaveCriticalSection(&g.cs);
-        log_line("link %d: connected to %s (Nexus %s)%s", pc, peer, peer_version[0] ? peer_version : "?",
-                 l.forward_secret ? ", forward secret" : "");
-        EnterCriticalSection(&p->send_cs);
-        p->link = l;
-        p->link_up = TRUE;
-        LeaveCriticalSection(&p->send_cs);
-        if (role == ROLE_MAIN) {
-            struct sockaddr_in a;
-            int al = sizeof a;
-            ULONG mac[2] = {0, 0}, ml = 6;
-            if (!getpeername(s, (struct sockaddr *)&a, &al) && SendARP(a.sin_addr.s_addr, 0, mac, &ml) == NO_ERROR && ml == 6) {
-                EnterCriticalSection(&g.cs);
-                memcpy(p->mac, mac, 6);
-                LeaveCriticalSection(&g.cs);
-            }
-        }
-        net_status(pc, NS_CONNECTED);
-        unsigned char *buf = malloc(1 + LINK_MAX);
-        int n;
-        while ((n = link_recv(&l, buf + 1, LINK_MAX)) > 0) {
-            unsigned char *m = buf + 1;
-            p->heard = GetTickCount();
-            if (m[0] == MSG_PING && n == 5) {
-                m[0] = MSG_PONG;
-                net_send(pc, m, 5);
-            } else if (m[0] >= MSG_UPDATE_BEGIN && m[0] <= MSG_UPDATE_END) {
-                if (role == ROLE_CONTROLLED) update_receive(m, n);
-            } else if (m[0] >= MSG_FILE_BEGIN && m[0] <= MSG_FILE_END) {
-                files_receive(m, n); /* written to disk here, so a big copy never queues up in memory */
-            } else {
-                unsigned char *copy = malloc(1 + n);
-                copy[0] = (unsigned char)pc;
-                memcpy(copy + 1, m, n);
-                PostMessageW(g.wnd, WM_NET_MSG, n, (LPARAM)copy);
-            }
-        }
-        free(buf);
-        log_line("link %d: closed (%s)", pc, n == LINK_RECV_FORGED ? "a frame did not open" : "connection ended");
-        /* ponytail: one incoming transfer at a time for all links; files only travel with input,
-         * which is in one place, so two PCs never send at once */
-        files_abort();
-        update_abort();
-    }
-    EnterCriticalSection(&p->send_cs);
-    p->link_up = FALSE;
-    LeaveCriticalSection(&p->send_cs);
-    EnterCriticalSection(&g.cs);
-    p->conn = INVALID_SOCKET;
-    closesocket(s);
-    LeaveCriticalSection(&g.cs);
+static int link_status(int r, int role)
+{
     switch (r) {
     case LINK_OK: return 0;
     case LINK_ERR_PEER: return NS_PEER;
@@ -565,6 +610,150 @@ static int session(int pc, SOCKET s, int role, const unsigned char key[32])
     case LINK_ERR_PASSWORD: return NS_PASSWORD;
     default: return role == ROLE_MAIN ? NS_UNREACHABLE : 0;
     }
+}
+
+/* The input link after its handshake: every message goes to the UI thread, pings answered here. A main
+ * PC opens a 0.7 PC's files and clipboard connections beside it. */
+static void session_run(int pc, SOCKET s, int role, Link l, const char *peer, const char *peer_version)
+{
+    Peer *p = &g.peer[pc];
+    /* An older PC gets file copies on this link too: without a cap Windows buffers megabytes of a copy
+     * at each end, and every move and key waits behind them. 64 KB still fills a home network. */
+    int buffer = 65536;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&buffer, sizeof buffer);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&buffer, sizeof buffer);
+    EnterCriticalSection(&g.cs);
+    MultiByteToWideChar(CP_UTF8, 0, peer, -1, p->name, 64);
+    lstrcpynA(p->version, peer_version, 16);
+    p->secret = l.forward_secret;
+    p->heard = GetTickCount();
+    LeaveCriticalSection(&g.cs);
+    log_line("link %d: connected to %s (Nexus %s)%s", pc, peer, peer_version[0] ? peer_version : "?",
+             l.forward_secret ? ", forward secret" : "");
+    unsigned char chan[2] = {MSG_CHANNEL, CHAN_INPUT};
+    BOOL own = role == ROLE_MAIN && link_v7(peer_version) && link_send(&l, chan, 2);
+    EnterCriticalSection(&p->send_cs);
+    p->link = l;
+    p->link_up = TRUE;
+    LeaveCriticalSection(&p->send_cs);
+    if (role == ROLE_MAIN) {
+        struct sockaddr_in a;
+        int al = sizeof a;
+        ULONG mac[2] = {0, 0}, ml = 6;
+        BOOL known = !getpeername(s, (struct sockaddr *)&a, &al);
+        if (known && SendARP(a.sin_addr.s_addr, 0, mac, &ml) == NO_ERROR && ml == 6) {
+            EnterCriticalSection(&g.cs);
+            memcpy(p->mac, mac, 6);
+            LeaveCriticalSection(&g.cs);
+        }
+        for (int k = CHAN_FILES; own && known && k <= CHAN_CLIP; k++) {
+            ChanStart *c = malloc(sizeof *c);
+            if (!c) break;
+            c->pc = pc, c->kind = k;
+            lstrcpynA(c->host, inet_ntoa(a.sin_addr), 16);
+            EnterCriticalSection(&g.cs);
+            memcpy(c->key, g.cfg.key, 32);
+            LeaveCriticalSection(&g.cs);
+            HANDLE t = CreateThread(NULL, 0, chan_thread, c, 0, NULL);
+            if (t) CloseHandle(t);
+            else free(c);
+        }
+    }
+    net_status(pc, NS_CONNECTED);
+    unsigned char *buf = malloc(1 + LINK_MAX);
+    int n;
+    while ((n = link_recv(&l, buf + 1, LINK_MAX)) > 0) {
+        unsigned char *m = buf + 1;
+        p->heard = GetTickCount();
+        if (m[0] == MSG_PING && n == 5) {
+            m[0] = MSG_PONG;
+            net_send(pc, m, 5);
+        } else if (m[0] >= MSG_UPDATE_BEGIN && m[0] <= MSG_UPDATE_END) {
+            if (role == ROLE_CONTROLLED) update_receive(m, n);
+        } else if (m[0] >= MSG_FILE_BEGIN && m[0] <= MSG_FILE_END) {
+            files_receive(m, n); /* an older PC's: written to disk here, so a big copy never queues up in memory */
+        } else {
+            unsigned char *copy = malloc(1 + n);
+            copy[0] = (unsigned char)pc;
+            memcpy(copy + 1, m, n);
+            PostMessageW(g.wnd, WM_NET_MSG, n, (LPARAM)copy);
+        }
+    }
+    free(buf);
+    log_line("link %d: closed (%s)", pc, n == LINK_RECV_FORGED ? "a frame did not open" : "connection ended");
+    chan_close(pc);
+    /* ponytail: one incoming transfer at a time for all links; files only travel with input,
+     * which is in one place, so two PCs never send at once */
+    files_abort();
+    update_abort();
+}
+
+static void session_end(int pc, SOCKET s)
+{
+    Peer *p = &g.peer[pc];
+    EnterCriticalSection(&p->send_cs);
+    p->link_up = FALSE;
+    LeaveCriticalSection(&p->send_cs);
+    EnterCriticalSection(&g.cs);
+    p->conn = INVALID_SOCKET;
+    closesocket(s);
+    LeaveCriticalSection(&g.cs);
+}
+
+/* Main PC: one connection to a controlled PC, from the handshake to its end. */
+static int session(int pc, SOCKET s, const unsigned char key[32])
+{
+    link_options(s);
+    EnterCriticalSection(&g.cs);
+    g.peer[pc].conn = s;
+    LeaveCriticalSection(&g.cs);
+    Link l;
+    char peer[64], peer_version[16];
+    int r = link_handshake(&l, s, TRUE, key, g.my_name, NEXUS_VERSION, peer, peer_version);
+    if (r == LINK_OK) session_run(pc, s, ROLE_MAIN, l, peer, peer_version);
+    session_end(pc, s);
+    return link_status(r, ROLE_MAIN);
+}
+
+/* Controlled PC: a connection from the main PC, its input link or (0.7) one for files or the clipboard. */
+static DWORD WINAPI conn_thread(void *arg)
+{
+    SOCKET s = (SOCKET)(INT_PTR)arg;
+    Peer *p = &g.peer[0];
+    unsigned char key[32], m[2];
+    EnterCriticalSection(&g.cs);
+    memcpy(key, g.cfg.key, 32);
+    LeaveCriticalSection(&g.cs);
+    link_options(s);
+    Link l;
+    char peer[64], peer_version[16];
+    int r = link_handshake(&l, s, FALSE, key, g.my_name, NEXUS_VERSION, peer, peer_version), kind = CHAN_INPUT;
+    SecureZeroMemory(key, sizeof key);
+    if (r == LINK_OK && link_v7(peer_version))
+        kind = link_recv(&l, m, 2) == 2 && m[0] == MSG_CHANNEL && m[1] <= CHAN_CLIP ? m[1] : -1;
+    for (int i = 0; kind > CHAN_INPUT && !p->link_up && i < 20; i++) Sleep(50); /* the input link's own thread is a step behind */
+    if (r != LINK_OK || kind < 0 || (kind != CHAN_INPUT && !p->link_up)) {
+        closesocket(s);
+        if (link_status(r, ROLE_CONTROLLED) && !p->link_up) net_status(0, link_status(r, ROLE_CONTROLLED));
+        return 0;
+    }
+    if (kind != CHAN_INPUT) {
+        chan_run(0, kind, s, &l);
+        return 0;
+    }
+    /* The main PC connecting again: its old link may not have timed out here yet, and gives way. */
+    EnterCriticalSection(&g.cs);
+    if (p->conn != INVALID_SOCKET) shutdown(p->conn, SD_BOTH);
+    LeaveCriticalSection(&g.cs);
+    EnterCriticalSection(&g.session_cs);
+    EnterCriticalSection(&g.cs);
+    p->conn = s;
+    LeaveCriticalSection(&g.cs);
+    session_run(0, s, ROLE_CONTROLLED, l, peer, peer_version);
+    session_end(0, s);
+    net_status(0, NS_WAITING);
+    LeaveCriticalSection(&g.session_cs);
+    return 0;
 }
 
 
@@ -673,6 +862,7 @@ static DWORD WINAPI net_thread(void *arg)
     int pc = (int)(INT_PTR)arg;
     Peer *p = &g.peer[pc];
     int gen = -1, sticky = 0; /* the last failure stays on screen until the next success or a config change */
+    int shown = -1;           /* controlled PC: "Waiting" shown for this config; a link's thread says the rest */
     for (;;) {
         EnterCriticalSection(&g.cs);
         int role = g.cfg.role;
@@ -686,7 +876,7 @@ static DWORD WINAPI net_thread(void *arg)
         LeaveCriticalSection(&g.cs);
 
         if (!ready) {
-            net_status(pc, NS_SETUP);
+            net_status(pc, NS_SETUP), shown = -1;
             WaitForSingleObject(p->wake, INFINITE);
             continue;
         }
@@ -707,15 +897,20 @@ static DWORD WINAPI net_thread(void *arg)
         } else {
             SOCKET ls = listen_socket();
             if (ls == INVALID_SOCKET) {
-                net_status(pc, NS_PORT);
+                net_status(pc, NS_PORT), shown = -1;
                 WaitForSingleObject(p->wake, 3000);
                 continue;
             }
-            net_status(pc, sticky ? sticky : NS_WAITING);
+            if (!p->link_up && shown != gen) net_status(pc, NS_WAITING), shown = gen;
             s = accept(ls, NULL, NULL);
             if (s == INVALID_SOCKET) continue; /* the listener was closed for a config change */
+            /* Each connection on its own thread: the input link, and a 0.7 main PC's files and clipboard. */
+            HANDLE t = CreateThread(NULL, 0, conn_thread, (void *)(INT_PTR)s, 0, NULL);
+            if (t) CloseHandle(t);
+            else closesocket(s);
+            continue;
         }
-        sticky = session(pc, s, role, key);
+        sticky = session(pc, s, key);
         if (sticky) net_status(pc, sticky);
         if (sticky || role == ROLE_MAIN) WaitForSingleObject(p->wake, sticky ? 3000 : 500);
     }
@@ -1299,12 +1494,33 @@ static void draw_control(const DRAWITEMSTRUCT *d)
             /* Under the name, the address; with no name yet, the address is the name and the state goes here. */
             text(dc, pp->name[0] ? pp->addr : pp->status == NS_UNREACHABLE ? L"Offline" : STATUS_WORD[pp->status], t, g.small, p->ink3,
                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        } else if (d->CtlID == ID_PIZZA) {
+            /* The studio's red button. The window is 6% larger than the button at rest, so the nudge
+             * can grow it (1 -> 1.06 -> 1 -> 1.03 -> 1) around its centre and brighten it at the peaks. */
+            float t = g.nudge_at ? (GetTickCount() - g.nudge_at) / (float)NUDGE_MS : 1, peak = 0, wave = 0;
+            if (t < 1) { /* two pulses, each a strong ease-out: up fast, settling slowly */
+                float u = t < 0.45f ? t / 0.45f : (t - 0.45f) / 0.55f, e = 1 - (1 - u) * (1 - u) * (1 - u);
+                wave = sinf(3.14159265f * e);
+                peak = t < 0.45f ? 0.06f : 0.03f;
+            }
+            float s = (1 + peak * wave) / 1.06f;
+            int bw = (int)(w * s), bh = (int)(h * s);
+            RECT b = {(w - bw) / 2, (h - bh) / 2, (w + bw) / 2, (h + bh) / 2};
+            COLORREF base = d->itemState & ODS_SELECTED ? RGB(0xBF, 0x30, 0x30)
+                          : d->hwndItem == g.hover ? RGB(0xE5, 0x48, 0x48) : RGB(0xD6, 0x3A, 0x3A);
+            COLORREF c = RGB(GetRValue(base) + (int)((0xF2 - GetRValue(base)) * wave),
+                             GetGValue(base) + (int)((0x55 - GetGValue(base)) * wave),
+                             GetBValue(base) + (int)((0x55 - GetBValue(base)) * wave));
+            round_rect(dc, &b, S(8), c, c, S(1));
+            SIZE ts;
+            SelectObject(dc, g.button);
+            GetTextExtentPoint32W(dc, label, lstrlenW(label), &ts);
+            int x = (w - S(22) - ts.cx) / 2;
+            draw_pizza(dc, x, (h - S(16)) / 2, S(16)); /* drawn, as XP has no emoji to put in the label */
+            RECT t2 = {x + S(22), 0, w, h};
+            text(dc, label, t2, g.button, RGB(255, 255, 255), DT_SINGLELINE | DT_VCENTER);
         } else {
             COLORREF c = d->CtlID == ID_UPDATE ? p->signal : hover ? p->ink : p->ink3;
-            if (d->CtlID == ID_PIZZA) { /* drawn, as XP has no emoji to put in the label */
-                draw_pizza(dc, 0, (h - S(16)) / 2, S(16));
-                r.left += S(22);
-            }
             text(dc, label, r, d->CtlID == ID_UPDATE ? g.button : g.small, c, DT_SINGLELINE | DT_VCENTER);
         }
         if (focus) {
@@ -1433,7 +1649,10 @@ static void layout_page(void)
     view_bottom = fy;
     MoveWindow(g.site, S(28), fy - S(44), S(SIDEBAR - 56), S(28), TRUE);
     MoveWindow(g.logs, S(28), fy - S(100), S(SIDEBAR - 56), S(28), TRUE);
-    MoveWindow(g.pizza, S(28), fy - S(130), S(SIDEBAR - 56), S(28), TRUE);
+    { /* 6% larger than the button it draws, room for the nudge */
+        int pw = S(SIDEBAR - 56) * 106 / 100, ph = S(28) * 106 / 100;
+        MoveWindow(g.pizza, S(28) - (pw - S(SIDEBAR - 56)) / 2, fy - S(130) - (ph - S(28)) / 2, pw, ph, TRUE);
+    }
     if (g.update_version[0] && g.cfg.role == ROLE_MAIN && !g.installing) {
         wchar_t label[48];
         _snwprintf(label, 48, L"Install Nexus %hs", g.update_version);
@@ -2068,6 +2287,16 @@ static void show_window(void)
     SetForegroundWindow(g.wnd);
 }
 
+/* The pizza button's nudge runs only while the window is on screen, and never with Windows' animation
+ * effects off (XP has no such setting: on stays on). */
+static void nudge_arm(BOOL on)
+{
+    BOOL anim = TRUE;
+    SystemParametersInfoW(0x1042 /* SPI_GETCLIENTAREAANIMATION */, 0, &anim, 0);
+    if (on && anim) SetTimer(g.wnd, TIMER_NUDGE, g.nudged ? 10000 : 3000, NULL);
+    else KillTimer(g.wnd, TIMER_NUDGE), KillTimer(g.wnd, TIMER_NUDGE_FRAME), g.nudge_at = 0;
+}
+
 static void tray_add(void)
 {
     g.tray.cbSize = NOTIFYICONDATAW_V2_SIZE; /* the size XP understands */
@@ -2142,6 +2371,39 @@ static BOOL open_clipboard(void)
     return FALSE;
 }
 
+typedef struct { int pc; BOOL v5; char *text; int text_n; unsigned char *picture; unsigned int picture_n; LONG gen; } ClipJob;
+static CRITICAL_SECTION clip_cs; /* one clipboard on its way at a time: clip_out's buffer, and its pieces in order */
+static volatile LONG clip_gen[MAX_PEERS]; /* the newest copy for each PC */
+
+/* Sends a copied clipboard on its own thread, so input never waits for a big picture to travel. */
+static DWORD WINAPI clip_thread(void *arg)
+{
+    ClipJob *j = arg;
+    EnterCriticalSection(&clip_cs);
+    if (j->gen != clip_gen[j->pc]) { /* a newer copy for the same PC was made meanwhile: that one goes */
+    } else if (j->v5) {
+        if (j->text) clip_out(CLIP_TEXT, j->text, j->text_n, clip_send, j->pc);
+        if (j->picture) clip_out(CLIP_DIB, j->picture, j->picture_n, clip_send, j->pc);
+        unsigned char end = MSG_CLIP_END;
+        clip_send(j->pc, &end, 1);
+        log_line("clipboard: sent %d bytes of text and a %u-byte picture to link %d", j->text ? j->text_n : 0,
+                 j->picture_n, j->pc);
+    } else if (j->text) {
+        unsigned char *msg = malloc(j->text_n + 1);
+        if (msg) {
+            msg[0] = MSG_CLIPBOARD;
+            memcpy(msg + 1, j->text, j->text_n);
+            clip_send(j->pc, msg, j->text_n + 1);
+            free(msg);
+        }
+    }
+    LeaveCriticalSection(&clip_cs);
+    free(j->text);
+    free(j->picture);
+    free(j);
+    return 0;
+}
+
 /* Text and a picture go together and the app that pastes picks (0.5 peers: text up to 256 KB, a CF_DIB
  * picture up to 8 MB, in pieces; over a limit that part stays behind, never cut short). An older peer
  * gets text up to 64 KB in one CLIPBOARD message, as before. */
@@ -2176,23 +2438,17 @@ static void clipboard_send(int pc)
     }
     CloseClipboard(); /* copied out first, so other apps are not kept waiting while it travels */
     clip_seq = GetClipboardSequenceNumber();
-    if (v5 && (text || picture)) {
-        if (text) clip_out(CLIP_TEXT, text, text_n, net_send, pc);
-        if (picture) clip_out(CLIP_DIB, picture, picture_n, net_send, pc);
-        unsigned char end = MSG_CLIP_END;
-        net_send(pc, &end, 1);
-        log_line("clipboard: sent %d bytes of text and a %u-byte picture to link %d", text ? text_n : 0, picture_n, pc);
-    } else if (text) {
-        unsigned char *msg = malloc(text_n + 1);
-        if (msg) {
-            msg[0] = MSG_CLIPBOARD;
-            memcpy(msg + 1, text, text_n);
-            net_send(pc, msg, text_n + 1);
-            free(msg);
-        }
+    ClipJob *j = text || picture ? malloc(sizeof *j) : NULL;
+    if (!j) {
+        free(text);
+        free(picture);
+        return;
     }
-    free(text);
-    free(picture);
+    j->pc = pc, j->v5 = v5, j->text = text, j->text_n = text_n, j->picture = picture, j->picture_n = picture_n;
+    j->gen = InterlockedIncrement(&clip_gen[pc]);
+    HANDLE t = CreateThread(NULL, 0, clip_thread, j, 0, NULL);
+    if (t) CloseHandle(t);
+    else clip_thread(j);
 }
 
 /* A complete set of clipboard pieces (0.5): every complete part goes on the clipboard at once. */
@@ -2427,6 +2683,7 @@ static void beat(void)
     if (connected && input_controlled_active()) {
         ping(0);
         BOOL stop = (LONG)(now - g.peer[0].heard) > LINK_DEAD_MS;
+        if (stop) log_line("link 0: silent for %lu ms while this PC had input; input stops here", (unsigned long)(now - g.peer[0].heard));
         locked = input_desktop_unlocked() ? 0 : locked + 1;
         if (locked >= 2) { /* twice in a row, 250 ms apart: not a flicker */
             log_line("this PC's desktop is locked: input goes back to the main PC");
@@ -2449,13 +2706,18 @@ static void beat(void)
 static void on_net_msg(int pc, unsigned char *msg, int len)
 {
     Peer *p = &g.peer[pc];
-    if (msg[0] == MSG_CLIPBOARD && len > 1) {
-        clipboard_set(msg + 1, len - 1);
-    } else if (msg[0] >= MSG_CLIP_BEGIN && msg[0] <= MSG_CLIP_END) {
-        if (clip_in(&g.clip_in, msg, len)) {
+    if ((msg[0] == MSG_CLIPBOARD && len > 1) || (msg[0] >= MSG_CLIP_BEGIN && msg[0] <= MSG_CLIP_END)) {
+        if (msg[0] == MSG_CLIPBOARD) {
+            clipboard_set(msg + 1, len - 1);
+        } else if (clip_in(&g.clip_in, msg, len)) {
             clipboard_take(&g.clip_in);
             clip_in_free(&g.clip_in);
+        } else {
+            return;
         }
+        /* Copied on a PC that input has already left for another (its own connection, or its own thread,
+         * can be a moment behind the crossing): it goes on there too. */
+        if (g.cfg.role == ROLE_MAIN && g.target >= 0 && g.target != pc) clip_seq = 0, clipboard_send(g.target);
     } else if (msg[0] == MSG_LOCKED && len == 1 && g.cfg.role == ROLE_MAIN && pc == g.target) {
         wchar_t t[200];
         g.target = -1;
@@ -2581,9 +2843,14 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) return nudge_arm(FALSE), 0;
+        if (!g.nudge_at && IsWindowVisible(w)) nudge_arm(TRUE); /* back from minimized */
         layout();
         redraw(NULL);
         return 0;
+    case WM_SHOWWINDOW:
+        nudge_arm(wp != 0);
+        break;
     case WM_GETMINMAXINFO:
         ((MINMAXINFO *)lp)->ptMinTrackSize.x = S(760);
         ((MINMAXINFO *)lp)->ptMinTrackSize.y = S(700);
@@ -2653,6 +2920,16 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_TIMER:
         if (wp == TIMER_BEAT) return beat(), 0;
+        if (wp == TIMER_NUDGE) {
+            if (!g.nudged) g.nudged = TRUE, SetTimer(w, TIMER_NUDGE, 10000, NULL);
+            if (g.hover != g.pizza) g.nudge_at = GetTickCount() | 1, SetTimer(w, TIMER_NUDGE_FRAME, 16, NULL);
+            return 0;
+        }
+        if (wp == TIMER_NUDGE_FRAME) {
+            if (GetTickCount() - g.nudge_at >= NUDGE_MS) g.nudge_at = 0, KillTimer(w, TIMER_NUDGE_FRAME);
+            InvalidateRect(g.pizza, NULL, FALSE);
+            return 0;
+        }
         if (discovery_expire() && g.page == PAGE_CONNECTION) refresh();
         if (g.cfg.role == ROLE_MAIN && GetTickCount() / 1000 % 3 == 0) discovery_probe();
         for (int i = 0; i < MAX_PEERS; i++) {
@@ -3096,7 +3373,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         g.peer[i].conn = INVALID_SOCKET;
         g.peer[i].rtt = -1;
         InitializeCriticalSection(&g.peer[i].send_cs);
+        for (int k = CHAN_FILES; k <= CHAN_CLIP; k++)
+            g.peer[i].ch[k].s = INVALID_SOCKET, InitializeCriticalSection(&g.peer[i].ch[k].cs);
     }
+    InitializeCriticalSection(&g.session_cs);
+    InitializeCriticalSection(&clip_cs);
     wchar_t name[MAX_COMPUTERNAME_LENGTH + 1];
     DWORD name_len = MAX_COMPUTERNAME_LENGTH + 1;
     GetComputerNameW(name, &name_len);
@@ -3152,7 +3433,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
                     win_w, win_h, NULL, NULL, inst, NULL);
     /* A test instance leaves this PC's mouse and keys alone, unless a test VM asks for real hooks. */
     if (!g.test || wcsstr(cmd, L"/hooks")) input_main_start(g.wnd);
-    files_init(g.wnd, net_send_bulk);
+    files_init(g.wnd, files_out);
     if (g.test) CloseHandle(CreateThread(NULL, 0, test_thread, NULL, 0, NULL));
     else update_start(g.wnd, is_main_pc);
     sync_input();

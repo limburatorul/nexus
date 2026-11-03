@@ -16,7 +16,11 @@ enum { MSG_HELLO = 1, MSG_PING, MSG_PONG, MSG_ENTER, MSG_LEAVE, MSG_MOVE, MSG_BU
        MSG_TEST /* test mode only */,
        /* 0.5 and later; an older peer never gets them (see SPEC.md) */
        MSG_KEX /* handshake: ephemeral X25519 public key */, MSG_LOCKED /* controlled PC: its desktop is locked */,
-       MSG_CLIP_BEGIN /* [format u8][size u32] */, MSG_CLIP_DATA, MSG_CLIP_END };
+       MSG_CLIP_BEGIN /* [format u8][size u32] */, MSG_CLIP_DATA, MSG_CLIP_END,
+       /* 0.7 and later */
+       MSG_CHANNEL /* first message on each connection from the main PC: [CHAN_*] */ };
+/* 0.7: files and the clipboard each have their own connection, so input never waits behind them. */
+enum { CHAN_INPUT, CHAN_FILES, CHAN_CLIP };
 enum { CLIP_TEXT = 1 /* UTF-8 */, CLIP_DIB /* CF_DIB: BITMAPINFOHEADER, colours, bits */ };
 #define CLIP_TEXT_MAX (256 * 1024)
 #define CLIP_IMAGE_MAX (8 * 1024 * 1024)

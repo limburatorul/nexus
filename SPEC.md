@@ -115,6 +115,14 @@ pe o grilă de 1,5 px, deci precizia e ±1 px.
   `CLIPBOARD 10` [text UTF-8], `AUDIO 11`, `AUDIO_STATE 12`, `FILE_BEGIN 13`–`FILE_END 16`, `UPDATE_BEGIN 17`–`UPDATE_END 19`,
   `TEST 20`, iar din 0.5: `KEX 21`, `LOCKED 22`, `CLIP_BEGIN 23` [format u8][mărime u32], `CLIP_DATA 24`, `CLIP_END 25`.
   Mesajele 21–25 pleacă doar spre un PC care a spus în HELLO că are ≥ 0.5; ENTER cu al șaptelea octet la fel.
+- **Conexiuni separate (0.7):** când ambele HELLO spun ≥ 0.7, principalul deschide pe același port încă două
+  conexiuni, fiecare cu handshake-ul ei complet. Primul mesaj al principalului pe fiecare e `CHANNEL 26` [tip u8]:
+  0 input (legătura de până acum), 1 fișiere, 2 clipboard. Fișierele (`FILE_*`) și clipboardul (`CLIPBOARD`,
+  `CLIP_*`) merg pe conexiunea lor, deci un fișier mare sau o poză nu mai țin pe loc mouse-ul și tastatura; restul
+  rămâne pe legătura de input. Cele două conexiuni nu au timeout (tac între copieri) și se închid odată cu legătura
+  de input. Controlatul acceptă fiecare conexiune pe firul ei; o legătură de input nouă o înlocuiește pe cea veche.
+  Dacă una nu se deschide, tipul ei merge pe legătura de input, ca înainte. Clipboardul se trimite pe un fir al lui;
+  un clipboard care ajunge la principal după ce inputul a trecut mai departe pleacă și spre PC-ul cu inputul.
 
 **Sunet (controlat → principal):**
 - Vista și mai nou: WASAPI loopback, adică exact ce se aude pe ieșirea implicită.
