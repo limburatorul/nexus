@@ -17,6 +17,7 @@ gdi32.dll!ellipse
 gdi32.dll!exttextoutw
 gdi32.dll!getdevicecaps
 gdi32.dll!getstockobject
+gdi32.dll!gettextextentpoint32w
 gdi32.dll!lineto
 gdi32.dll!movetoex
 gdi32.dll!rectangle
@@ -44,6 +45,7 @@ kernel32.dll!loadresource
 kernel32.dll!lockresource
 kernel32.dll!lstrcmpw
 kernel32.dll!lstrcpynw
+kernel32.dll!lstrlenw
 kernel32.dll!muldiv
 kernel32.dll!setunhandledexceptionfilter
 kernel32.dll!sizeofresource
@@ -103,6 +105,8 @@ user32.dll!getwindowtextw
 user32.dll!invalidaterect
 user32.dll!isdialogmessagew
 user32.dll!isiconic
+user32.dll!iswindowvisible
+user32.dll!killtimer
 user32.dll!loadcursorw
 user32.dll!loadiconw
 user32.dll!loadimagew
